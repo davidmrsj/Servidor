@@ -1,0 +1,11 @@
+# Virtual environment
+venv/
+.env/
+
+__pycache__/
+*.py[cod]
+*$py.class
+
+/models
+
+/gfpgan
