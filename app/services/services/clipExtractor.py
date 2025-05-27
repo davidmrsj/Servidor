@@ -32,10 +32,15 @@ import numpy as np
 import librosa
 import cv2
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
+import moviepy
 from typing import List, Dict
 from app.services.services.download_youtube_video import download_video
-import validators # For URL validation - this is a new dependency to note
-# Ensure 'os' is imported if not already (it should be for cut_clips)
+import validators
+from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig, pipeline
+from faster_whisper import WhisperModel
+from yolov5 import YOLOv5
+from fer import FER
+
 
 # ───────── CONFIGURACIÓN BÁSICA ───────── #
 # VIDEO_PATH   = "input.mp4"   # ruta al vídeo de prueba (~3 min) # Now handled in main
@@ -45,6 +50,7 @@ MIN_CLIP_LEN = 60  # minimum duration of each clip (s)
 MAX_CLIP_LEN = 90  # maximum duration of each clip (s)
 AUDIO_W      = 2.0           # peso del audio en la puntuación
 MOTION_W     = 1.0           # peso del movimiento
+MODELS_DIR   = "models"
 # ───────── AI MODEL CONFIGURATION (Placeholders) ───────── #
 # MODEL_PATH_STT = "path/to/stt_model"                # Path to Speech-to-Text model
 # MODEL_PATH_LLM = "path/to/language_model"           # Path to Large Language Model
@@ -91,6 +97,42 @@ VIRALITY_CONFIG = {
 # or models could be passed as arguments if managed centrally.
 # ─────────────────────────────────────────────────── #
 # ──────────────────────────────────────── #
+
+# Modelos AI globales
+_stt_model = None
+_llm_pipeline = None
+_yolo_model = None
+_fer_detector = None
+
+def load_stt_model():
+    global _stt_model
+    # Ruta a modelos/whisper-small
+    _stt_model = WhisperModel(
+        model_size_or_path="models/whisper-small",
+        device="cuda",           # usa GPU
+        compute_type="float16"      # o "float16" para más calidad
+    )
+
+def load_llm():
+    global _llm_pipeline
+    bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_quant_type="nf4")
+    tokenizer = AutoTokenizer.from_pretrained("meta-llama/Llama-2-7b-chat-hf", cache_dir=MODELS_DIR)
+    model = AutoModelForCausalLM.from_pretrained(
+        "meta-llama/Llama-2-7b-chat-hf",
+        quantization_config=bnb_config,
+        device_map="auto",
+        cache_dir=MODELS_DIR
+    )
+    _llm_pipeline = pipeline("text-generation", model=model, tokenizer=tokenizer, device=0)
+
+
+def load_vision_models():
+    global _yolo_model, _fer_detector
+    # YOLOv5
+    yolo_weights = os.path.join(MODELS_DIR, 'yolov5s.pt')
+    _yolo_model = YOLOv5(yolo_weights, device='cuda')
+    # FER
+    _fer_detector = FER(mtcnn=True)
 
 def audio_peaks(video_path: str, win: float) -> np.ndarray:
     """Devuelve energía RMS por ventana.
@@ -143,56 +185,35 @@ def motion_peaks(video_path: str, win: float) -> np.ndarray:
 
 
 def analyze_text(transcript_segment: str, timestamp_info: Dict) -> Dict:
-    """Analyzes a text segment for sentiment, keywords, topics, humor, controversy, and engagement hooks. Placeholder for actual LLM/NLP model integration."""
-    # VRAM_NOTE: Ensure LLM is loaded/used efficiently. Consider techniques like:
-    # - Model quantization (e.g., GGUF for llama.cpp, ONNX quantization).
-    # - Offloading parts of the model to CPU if VRAM is insufficient.
-    # - Using smaller, fine-tuned models specific to the tasks (sentiment, keywords).
-    # TODO: Implement actual text analysis using an LLM or NLP libraries.
-    # - Sentiment Analysis (e.g., positive, negative, neutral, joy, anger)
-    # - Keyword/Topic Extraction
-    # - Humor/Controversy Detection (e.g., using keyword spotting or specialized models)
-    # - Engagement Hook Identification (e.g., questions, exclamations, calls to action)
-    
-    # Dummy results (replace with actual model outputs)
-    analysis_results = {
-        'timestamp_info': timestamp_info,
-        'sentiment': {'label': 'neutral', 'score': 0.6}, # Example: 'positive', 'negative'
-        'emotions': ['curiosity', 'slight_interest'], # Example granular emotions
-        'keywords': ['sample', 'transcript', 'topic'],
-        'topics': ['example_topic', 'discussion_point'],
-        'humor_detected': False,
-        'controversy_detected': False,
-        'engagement_hooks': ['question_found_example: what do you think?'],
-        'summary': f"This segment from {timestamp_info['start']}s to {timestamp_info['end']}s appears to be about related keywords."
-    }
-    return analysis_results
-
+    if _llm_pipeline is None:
+        load_llm()
+    prompt = f"Analiza sentimientos, emociones y keywords en el siguiente texto: <<{transcript_segment}>>"
+    out = _llm_pipeline(prompt, max_length=512, do_sample=False)[0]['generated_text']
+    # parsear la salida según formato JSON o etiquetas
+    # por simplicidad devolvemos un diccionario minimal
+    return {'timestamp_info': timestamp_info, 'llm_output': out}
 
 def analyze_visuals(video_segment_path: str, timestamp_info: Dict) -> Dict:
-    """Analyzes a video segment for key visual moments like expressions, actions, and scene changes. Placeholder for actual vision model integration."""
-    # VRAM_NOTE: Vision models can be VRAM intensive. Consider:
-    # - Unloading other large models (like LLMs) from VRAM if running sequentially.
-    # - Using smaller architectures or quantized versions (e.g., ONNX).
-    # - Processing frames at a lower resolution or frame rate if acceptable.
-    # TODO: Implement actual visual analysis using vision models.
-    # - Facial Expression Recognition (e.g., happy, sad, surprised)
-    # - Action Recognition / Object Detection (e.g., specific actions, important objects)
-    # - Scene Change Detection / Fast Cuts / Dramatic Pauses
-    
-    # Dummy results (replace with actual model outputs)
-    analysis_results = {
-        'timestamp_info': timestamp_info,
-        'facial_expressions': [{'person_id': 1, 'expression': 'neutral', 'confidence': 0.7, 'timestamp': timestamp_info['start'] + 1.0}],
-        'detected_actions': [], # e.g., ['hand_wave', 'pointing']
-        'key_objects': [],     # e.g., ['book', 'computer']
-        'scene_changes': [{'type': 'cut', 'timestamp': timestamp_info['start'] + 2.5}], # Could also be 'fade', 'dissolve'
-        'visual_intensity_score': 0.3, # Placeholder for overall visual activity or interest
-        'notes': f"Visual analysis for segment at {video_segment_path} from {timestamp_info['start']}s to {timestamp_info['end']}s."
-    }
-    # In a real scenario, you might need to extract frames from video_segment_path
-    # or use a library that can process video files directly.
-    return analysis_results
+    if _yolo_model is None or _fer_detector is None:
+        load_vision_models()
+    # Extraer frames clave
+    cap = cv2.VideoCapture(video_segment_path)
+    frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    picks = [int(i * frame_count / 5) for i in range(5)]
+    actions = []
+    expressions = []
+    for idx in picks:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+        ret, frame = cap.read()
+        if not ret: continue
+        # detección de objetos/acción
+        results = _yolo_model.predict(frame)
+        actions.extend([r['name'] for r in results])
+        # detección facial
+        expr = _fer_detector.detect_emotions(frame)
+        expressions.extend(expr)
+    cap.release()
+    return {'timestamp_info': timestamp_info, 'actions': actions, 'expressions': expressions}
 
 
 def calculate_virality_score(
@@ -451,20 +472,19 @@ def cut_clips(video_path: str, segments: List[Dict[str, float]], outdir="clips")
 
 
 def transcribe_video(video_path: str) -> List[Dict]:
-    """
-    Transcribe video audio to text with timestamps.
-    This is a placeholder function.
-    """
-    # TODO: Implement actual STT logic using a library like Whisper, Vosk, or an API.
-    print(f"ℹ️  Placeholder STT: Simulating transcription for {video_path}")
-    return [
-        {'start_time': 10.0, 'end_time': 15.0, 'text': 'This is a sample transcript segment.'},
-        {'start_time': 16.0, 'end_time': 20.0, 'text': 'Another example sentence from the video.'},
-        {'start_time': 22.0, 'end_time': 28.0, 'text': 'This part discusses an interesting topic.'},
-        {'start_time': 30.0, 'end_time': 35.0, 'text': 'And here is a call to action or a question.'},
-        {'start_time': 36.0, 'end_time': 40.0, 'text': 'More speech detected here.'},
-        {'start_time': 42.0, 'end_time': 48.0, 'text': 'Final segment of this dummy transcript.'}
-    ]
+    if _stt_model is None:
+        load_stt_model()
+    print(f"ℹ️  Transcribing con Whisper: {video_path}")
+    result = _stt_model.transcribe(video_path)
+    segments = []
+    for seg in result['segments']:
+        segments.append({
+            'start_time': seg['start'],
+            'end_time': seg['end'],
+            'text': seg['text']
+        })
+    return segments
+
 
 def main():
     # ───────── AI MODEL LOADING (Placeholders) ───────── #
@@ -484,7 +504,7 @@ def main():
     and clip cutting.
     """
     # video_input_source = "input.mp4"  # Example for local file
-    video_input_source = "https://www.youtube.com/watch?v=dQw4w9WgXcQ" # Example YouTube URL
+    video_input_source = "https://youtu.be/fEufZ5HG4ko?si=u7cU3wXemic2BH1o" # Example YouTube URL
     # This could also be made an argument to main() or read from config/argv in a fuller app
     
     video_path_for_processing = None
