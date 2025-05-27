@@ -2,8 +2,8 @@
 from io import BytesIO
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import Response, StreamingResponse
-from app.services.media.upscalerImages import ImageUpscaler
-from app.services.media.qualityFaceConversion import GFPGANService
+from app.services.services.upscalerImages import ImageUpscaler
+from app.services.services.qualityFaceConversion import GFPGANService
 
 app = FastAPI()
 
