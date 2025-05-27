@@ -27,10 +27,10 @@ class ImageUpscaler:
             scale=4,
             model_path=self.model_path,
             model=rrdbnet,
-            tile=256,       # tamaño del tile
+            tile=512,       # tamaño del tile
             tile_pad=10,    # relleno para evitar bordes
             pre_pad=10,
-            half=True,
+            half=False,
             device=self.device
         )
 
