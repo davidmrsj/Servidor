@@ -2,18 +2,14 @@
 from io import BytesIO
 from fastapi import FastAPI, File, UploadFile
 from fastapi.responses import Response, StreamingResponse
-from app.services.services.upscalerImages import ImageUpscaler
-from app.services.services.qualityFaceConversion import GFPGANService
-import app.services.services.clipExtractor as clipExtractor
+from app.services.media.upscalerImages import ImageUpscaler
+from app.services.media.qualityFaceConversion import GFPGANService
 
 app = FastAPI()
 
 # Cargamos la clase en una variable global (para que no se recargue en cada request)
 upscaler = ImageUpscaler()
 qualityFaces = GFPGANService()
-
-clipExtractor.main()
-
 
 @app.get("/")
 async def home():

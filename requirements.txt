@@ -12,3 +12,9 @@ Pillow
 python-multipart
 yt-dlp
 validators
+transformers
+faster_whisper
+yolov5
+fer
+bitsandbytes
+accelerate
