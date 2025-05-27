@@ -1,13 +1,28 @@
 """
 highlight_extractor.py
-Detecta los 2-3 clips más interesantes de un vídeo (~3 min) usando:
-- picos de audio (energía RMS por segundo, librosa)
-- movimiento visual (diferencia de fotogramas, OpenCV)
-Luego corta cada fragmento con FFmpeg.
+Identifies and extracts potentially viral short clips from a longer video.
 
-Requisitos:
-  pip install numpy librosa soundfile opencv-python moviepy
-  ffmpeg.exe accesible en el PATH
+Core Functionality:
+- Analyzes video for audio peaks (RMS energy) and visual motion (frame differences).
+- (Placeholder) Transcribes audio and performs AI-based text and visual analysis on
+  sliding windows of the video to calculate a 'virality score'.
+- Selects the top N non-overlapping segments based on these scores.
+- Uses FFmpeg to cut the selected segments into individual clip files.
+
+Input:
+- Can process a local video file or download a video from a YouTube URL.
+
+Output:
+- Generates .mp4 clip files in a specified output directory (default 'clips/').
+- Prints progress, selected segment info, and error messages to the console.
+
+Key Dependencies:
+  numpy, librosa, opencv-python, moviepy, yt-dlp, validators, ffmpeg (system path).
+
+Usage:
+  Modify `video_input_source` in `main()` to a local path or YouTube URL.
+  Run directly: `python clipExtractor.py`
+  (Further configuration options are available as global constants in the script).
 """
 
 import os
@@ -18,12 +33,12 @@ import librosa
 import cv2
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from typing import List, Dict
-from transformers import pipeline
-from faster_whisper import WhisperModel
-from ultralytics import YOLO
+from app.services.services.download_youtube_video import download_video
+import validators # For URL validation - this is a new dependency to note
+# Ensure 'os' is imported if not already (it should be for cut_clips)
 
 # ───────── CONFIGURACIÓN BÁSICA ───────── #
-VIDEO_PATH   = "input.mp4"   # ruta al vídeo de prueba (~3 min)
+# VIDEO_PATH   = "input.mp4"   # ruta al vídeo de prueba (~3 min) # Now handled in main
 TARGET_CLIPS = 10            # clips a extraer
 WIN_SIZE     = 1.0           # ventana de análisis (s)
 MIN_CLIP_LEN = 60  # minimum duration of each clip (s)
@@ -61,10 +76,6 @@ VIRALITY_CONFIG = {
     },
     'trending_keywords': ['challenge', 'hack', 'reveal', 'shocking', 'must-see'] # Example
 }
-
-sentiment_pipeline = pipeline("sentiment-analysis", model="cardiffnlp/twitter-roberta-base-sentiment-latest", device=0)
-yolo_model = YOLO("YOLOv8m.pt")
-
 # ─────────────────────────────────────────────────── #
 
 # ─── VRAM & EFFICIENCY STRATEGY (General Note) ─── #
@@ -132,53 +143,55 @@ def motion_peaks(video_path: str, win: float) -> np.ndarray:
 
 
 def analyze_text(transcript_segment: str, timestamp_info: Dict) -> Dict:
-    result = sentiment_pipeline(transcript_segment[:512])[0]
-    sentiment_label = result['label'].lower()  # 'positive', 'negative', 'neutral'
-    sentiment_score = result['score']
+    """Analyzes a text segment for sentiment, keywords, topics, humor, controversy, and engagement hooks. Placeholder for actual LLM/NLP model integration."""
+    # VRAM_NOTE: Ensure LLM is loaded/used efficiently. Consider techniques like:
+    # - Model quantization (e.g., GGUF for llama.cpp, ONNX quantization).
+    # - Offloading parts of the model to CPU if VRAM is insufficient.
+    # - Using smaller, fine-tuned models specific to the tasks (sentiment, keywords).
+    # TODO: Implement actual text analysis using an LLM or NLP libraries.
+    # - Sentiment Analysis (e.g., positive, negative, neutral, joy, anger)
+    # - Keyword/Topic Extraction
+    # - Humor/Controversy Detection (e.g., using keyword spotting or specialized models)
+    # - Engagement Hook Identification (e.g., questions, exclamations, calls to action)
     
+    # Dummy results (replace with actual model outputs)
     analysis_results = {
         'timestamp_info': timestamp_info,
-        'sentiment': {'label': sentiment_label, 'score': sentiment_score},
-        'emotions': ['joy'] if sentiment_label == 'positive' else ['neutral'],
-        'keywords': [],  # Placeholder: add keyword extractor if needed
-        'topics': [],    # Placeholder
-        'humor_detected': False,  # Extendable
-        'controversy_detected': sentiment_label == 'negative',
-        'engagement_hooks': [],
-        'summary': f"Sentiment: {sentiment_label} ({sentiment_score:.2f})"
+        'sentiment': {'label': 'neutral', 'score': 0.6}, # Example: 'positive', 'negative'
+        'emotions': ['curiosity', 'slight_interest'], # Example granular emotions
+        'keywords': ['sample', 'transcript', 'topic'],
+        'topics': ['example_topic', 'discussion_point'],
+        'humor_detected': False,
+        'controversy_detected': False,
+        'engagement_hooks': ['question_found_example: what do you think?'],
+        'summary': f"This segment from {timestamp_info['start']}s to {timestamp_info['end']}s appears to be about related keywords."
     }
     return analysis_results
 
 
 def analyze_visuals(video_segment_path: str, timestamp_info: Dict) -> Dict:
-    cap = cv2.VideoCapture(video_segment_path)
-    frame_count = 0
-    scene_changes = 0
-    expressions = []
+    """Analyzes a video segment for key visual moments like expressions, actions, and scene changes. Placeholder for actual vision model integration."""
+    # VRAM_NOTE: Vision models can be VRAM intensive. Consider:
+    # - Unloading other large models (like LLMs) from VRAM if running sequentially.
+    # - Using smaller architectures or quantized versions (e.g., ONNX).
+    # - Processing frames at a lower resolution or frame rate if acceptable.
+    # TODO: Implement actual visual analysis using vision models.
+    # - Facial Expression Recognition (e.g., happy, sad, surprised)
+    # - Action Recognition / Object Detection (e.g., specific actions, important objects)
+    # - Scene Change Detection / Fast Cuts / Dramatic Pauses
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-        frame_count += 1
-        if frame_count % 10 == 0:
-            results = yolo_model(frame)
-            for det in results[0].boxes.cls.tolist():
-                if det == 0:  # person
-                    expressions.append('person_detected')
-                if det in [24, 25, 26]:  # sports ball, skateboard, etc.
-                    scene_changes += 1
-    cap.release()
-    
+    # Dummy results (replace with actual model outputs)
     analysis_results = {
         'timestamp_info': timestamp_info,
-        'facial_expressions': [{'expression': 'happy', 'confidence': 0.7}] if 'person_detected' in expressions else [],
-        'detected_actions': ['action_detected'] if scene_changes > 2 else [],
-        'key_objects': [],
-        'scene_changes': [{'type': 'cut', 'timestamp': timestamp_info['start'] + 1}],
-        'visual_intensity_score': min(1.0, scene_changes / 10.0),
-        'notes': f"YOLO detections: {scene_changes} scene changes"
+        'facial_expressions': [{'person_id': 1, 'expression': 'neutral', 'confidence': 0.7, 'timestamp': timestamp_info['start'] + 1.0}],
+        'detected_actions': [], # e.g., ['hand_wave', 'pointing']
+        'key_objects': [],     # e.g., ['book', 'computer']
+        'scene_changes': [{'type': 'cut', 'timestamp': timestamp_info['start'] + 2.5}], # Could also be 'fade', 'dissolve'
+        'visual_intensity_score': 0.3, # Placeholder for overall visual activity or interest
+        'notes': f"Visual analysis for segment at {video_segment_path} from {timestamp_info['start']}s to {timestamp_info['end']}s."
     }
+    # In a real scenario, you might need to extract frames from video_segment_path
+    # or use a library that can process video files directly.
     return analysis_results
 
 
@@ -439,18 +452,19 @@ def cut_clips(video_path: str, segments: List[Dict[str, float]], outdir="clips")
 
 def transcribe_video(video_path: str) -> List[Dict]:
     """
-    Transcribe video audio to text with timestamps using Whisper.
+    Transcribe video audio to text with timestamps.
+    This is a placeholder function.
     """
-    model = WhisperModel("medium", device="cuda", compute_type="float16")
-    segments, info = model.transcribe(video_path, beam_size=5)
-    transcript = []
-    for seg in segments:
-        transcript.append({
-            'start_time': seg.start,
-            'end_time': seg.end,
-            'text': seg.text.strip()
-        })
-    return transcript
+    # TODO: Implement actual STT logic using a library like Whisper, Vosk, or an API.
+    print(f"ℹ️  Placeholder STT: Simulating transcription for {video_path}")
+    return [
+        {'start_time': 10.0, 'end_time': 15.0, 'text': 'This is a sample transcript segment.'},
+        {'start_time': 16.0, 'end_time': 20.0, 'text': 'Another example sentence from the video.'},
+        {'start_time': 22.0, 'end_time': 28.0, 'text': 'This part discusses an interesting topic.'},
+        {'start_time': 30.0, 'end_time': 35.0, 'text': 'And here is a call to action or a question.'},
+        {'start_time': 36.0, 'end_time': 40.0, 'text': 'More speech detected here.'},
+        {'start_time': 42.0, 'end_time': 48.0, 'text': 'Final segment of this dummy transcript.'}
+    ]
 
 def main():
     # ───────── AI MODEL LOADING (Placeholders) ───────── #
@@ -462,37 +476,126 @@ def main():
     # vision_model = load_vision_model(MODEL_PATH_VISION) # Replace with actual Vision model loading
     # print("🧠 AI Models (placeholders) would be loaded here if they were implemented.")
     # ─────────────────────────────────────────────────── #
-    print("⏳ Transcribiendo vídeo (simulado)...")
-    full_transcript = transcribe_video(VIDEO_PATH)
-    print(f"🎙️ Full transcript (dummy): {full_transcript[:2]}...")
 
-    print("⏳ Analizando audio...")
-    audio_rms = audio_peaks(VIDEO_PATH, WIN_SIZE)
+    """
+    Main function to orchestrate the video processing pipeline.
+    Handles input (local file or YouTube URL), downloads if necessary,
+    then runs transcription, audio/visual analysis, segment selection,
+    and clip cutting.
+    """
+    # video_input_source = "input.mp4"  # Example for local file
+    video_input_source = "https://www.youtube.com/watch?v=dQw4w9WgXcQ" # Example YouTube URL
+    # This could also be made an argument to main() or read from config/argv in a fuller app
+    
+    video_path_for_processing = None
 
-    print("⏳ Analizando vídeo...")
-    motion = motion_peaks(VIDEO_PATH, WIN_SIZE)
+    print(f"Processing input: {video_input_source}")
 
-    print("⏳ Combinando puntuaciones...")
+    if validators.url(video_input_source):
+        print(f"Input identified as URL. Attempting download...")
+        download_output_dir = "app/media" 
+        
+        downloaded_path = download_video(video_input_source, output_dir=download_output_dir)
+        if downloaded_path:
+            video_path_for_processing = downloaded_path
+            print(f"Video ready for processing: {video_path_for_processing}")
+        else:
+            print(f"Failed to download video from URL: {video_input_source}. Exiting.")
+            return # Exit main if download fails
+    else:
+        print(f"Input identified as local file path: {video_input_source}")
+        if os.path.exists(video_input_source):
+            video_path_for_processing = video_input_source
+            print(f"Local video found: {video_path_for_processing}")
+        else:
+            print(f"Local video file not found: {video_input_source}. Exiting.")
+            return # Exit main if local file not found
+    
+    if not video_path_for_processing:
+        print("No valid video to process. Exiting.")
+        return
+
+    try:
+        print("🎙️ Transcribing video (placeholder)...")
+        full_transcript = transcribe_video(video_path_for_processing)
+        print("✅ Transcription (placeholder) complete.")
+    except Exception as e:
+        print(f"❌ ERROR during transcription (placeholder): {e}")
+        print("Could not perform transcription. Exiting.")
+        return
+
+    try:
+        print("⏳ Analyzing audio...")
+        audio_rms = audio_peaks(video_path_for_processing, WIN_SIZE)
+        print("✅ Audio analysis complete.")
+    except Exception as e:
+        print(f"❌ ERROR during audio analysis: {e}")
+        print("Could not perform audio analysis. Exiting.")
+        return
+
+    try:
+        print("⏳ Analyzing video for motion...")
+        motion = motion_peaks(video_path_for_processing, WIN_SIZE)
+        print("✅ Motion analysis complete.")
+    except Exception as e:
+        print(f"❌ ERROR during motion analysis: {e}")
+        print("Could not perform motion analysis. Exiting.")
+        return
+
+    # print("⏳ Combinando puntuaciones...") # This was for the old combined_score, can be removed
     # The old combined_score is no longer the primary source for best_segments' first parameter
     # score = combined_score(audio_rms, motion, AUDIO_W, MOTION_W, text_analysis_results=None, visual_analysis_results=None)
 
-    # segments = best_segments(score, WIN_SIZE, TARGET_CLIPS, MIN_CLIP_LEN) # Old call
-    segments = best_segments(VIDEO_PATH, full_transcript, audio_rms, motion, WIN_SIZE, TARGET_CLIPS, MIN_CLIP_LEN, MAX_CLIP_LEN)
+    segments = [] # Initialize segments
+    try:
+        print("🧠 Identifying best segments with AI (placeholders)...")
+        segments = best_segments(
+            video_path_for_processing,
+            full_transcript,
+            audio_rms,
+            motion,
+            WIN_SIZE,
+            TARGET_CLIPS,
+            MIN_CLIP_LEN,
+            MAX_CLIP_LEN
+        )
+        print("✅ Segment identification complete.")
+    except Exception as e:
+        print(f"❌ ERROR during segment identification: {e}")
+        print("Could not identify best segments. Exiting.")
+        return
     
-    print("🔖 Segmentos seleccionados (Top 10):")
+    files = [] # Initialize files
+    print("🔖 Segmentos seleccionados (Top " + str(TARGET_CLIPS) + "):")
     if segments:
         for i, seg_info in enumerate(segments):
-            # Ensure start, end, and score are rounded for cleaner display if needed
             start_time_str = f"{seg_info['start']:.2f}"
             end_time_str = f"{seg_info['end']:.2f}"
             virality_score_str = f"{seg_info['score']:.2f}"
             print(f"Clip #{i+1}: [{start_time_str}s - {end_time_str}s], Virality Score: {virality_score_str}")
-    else:
-        print("No segments were selected.")
+        
+        try:
+            print("✂️  Cutting clips...")
+            files = cut_clips(video_path_for_processing, segments) 
+            print("✅ Clips generated successfully.")
+            if not files:
+                print("⚠️ WARNING: `cut_clips` executed but returned no file paths. Clips might be missing.")
+            else:
+                print(f"🎞️ Generated clip files: {files}")
 
-    print("✂️  Cortando clips...")
-    files = cut_clips(VIDEO_PATH, segments)
-    print("✅ Clips generados:", files)
+        except Exception as e:
+            print(f"❌ ERROR during clip cutting: {e}")
+            # files is already initialized to [] or contains results from cut_clips
+            print("Could not cut clips.") 
+            # Not returning here, so it can still print the "No clips were generated" if applicable
+
+    else:
+        print("No segments were selected by `best_segments`.")
+        # files is already initialized to []
+
+    # Final check
+    if not files: 
+        print("⚠️ FINAL WARNING: No clips were ultimately generated or saved from the video.")
 
 
 if __name__ == "__main__":

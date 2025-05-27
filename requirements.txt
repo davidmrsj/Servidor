@@ -10,3 +10,5 @@ numpy
 opencv-python
 Pillow
 python-multipart
+yt-dlp
+validators
