@@ -21,6 +21,7 @@ Usage:
   Run directly: `python clipExtractor.py`
 """
 
+import torch
 import os
 import subprocess
 import tempfile
@@ -31,7 +32,13 @@ from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
 from typing import List, Dict, Optional 
 from app.services.services.download_youtube_video import download_video
 import validators 
+from transformers import BitsAndBytesConfig, pipeline
 
+bnb_config = BitsAndBytesConfig(
+    load_in_4bit=True,
+    bnb_4bit_quant_type="nf4",
+    bnb_4bit_compute_dtype=torch.float16
+)
 # Attempt to import AI models; handle ImportError if they are not installed
 try:
     from faster_whisper import WhisperModel
@@ -114,8 +121,8 @@ MOTION_W     = 1.0
 
 # ───────── AI MODEL CONFIGURATION ───────── #
 MODEL_PATH_STT = "openai/whisper-small" # Now directly Hugging Face model ID
-MODEL_PATH_LLM = "distilgpt2" # Example small LLM from Hugging Face
-# MODEL_PATH_VISION_YOLO = "yolov5s.pt" # Will be joined with MODELS_DIR
+MODEL_PATH_LLM = "meta-llama/Llama-2-7b-chat-hf"
+MODEL_PATH_VISION_YOLO = "yolov5s.pt" # Will be joined with MODELS_DIR
 # ────────────────────────────────────────── #
 
 # ───────── VIRALITY SCORING CONFIGURATION (Copied from previous state) ───────── #
@@ -168,24 +175,31 @@ def load_stt_model():
             _stt_model = None
 
 def load_llm_model():
-    global _llm, _tokenizer
-    if AutoTokenizer is None or AutoModelForCausalLM is None:
-        print("ℹ️ transformers library not available. LLM cannot be loaded. Text analysis will use placeholders.")
+    global _llm, _tokenizer # Global model variables
+    
+    if 'AutoTokenizer' not in globals() or AutoTokenizer is None or \
+       'AutoModelForCausalLM' not in globals() or AutoModelForCausalLM is None or \
+       'BitsAndBytesConfig' not in globals() or BitsAndBytesConfig is None:
+        print("ℹ️ Key transformers components not available. LLM cannot be loaded.")
         return
 
-    if _llm is None or _tokenizer is None:
+    if _llm is None or _tokenizer is None: # Only load if not already loaded
         try:
-            os.makedirs(MODELS_DIR, exist_ok=True) # Ensure models directory exists
-            print(f"🧠 Loading LLM model and tokenizer: {MODEL_PATH_LLM} (from cache or Hugging Face)...")
-            # Transformers will download from Hugging Face to cache_dir if not present.
-            # Default cache is ~/.cache/huggingface/hub
-            _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH_LLM)
-            _llm = AutoModelForCausalLM.from_pretrained(MODEL_PATH_LLM)
-            # If using GPU: _llm.to('cuda')
-            print("✅ LLM model and tokenizer loaded successfully.")
+            os.makedirs(MODELS_DIR, exist_ok=True)
+            print(f"🧠 Loading LLM model and tokenizer: {MODEL_PATH_LLM} (Llama-2, 4-bit)...")
+            _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH_LLM, cache_dir=MODELS_DIR)
+            _llm = AutoModelForCausalLM.from_pretrained(
+                MODEL_PATH_LLM,
+                quantization_config=bnb_config,
+                device_map="auto",
+                cache_dir=MODELS_DIR,
+                trust_remote_code=True
+            )
+            print(f"✅ LLM model ({MODEL_PATH_LLM}) and tokenizer loaded successfully.")
         except Exception as e:
-            print(f"❌ ERROR loading LLM model: {e}")
-            print("LLM-based text analysis will use placeholders.")
+            print(f"❌ ERROR loading LLM model ({MODEL_PATH_LLM}): {e}")
+            print("    Ensure you have accepted Llama-2's license on Hugging Face.")
+            print("    Ensure 'bitsandbytes' and 'accelerate' are installed.")
             _llm, _tokenizer = None, None
 
 def load_vision_models():
@@ -314,25 +328,40 @@ def transcribe_video(video_path: str) -> List[Dict]:
             except Exception as e_rem: print(f"Error removing temp audio file {audio_output_path}: {e_rem}")
 
 def analyze_text(transcript_segment: str, timestamp_info: Dict) -> Dict:
+    # TODO: Implement robust parsing of LLM output for structured data.
     if _llm is None or _tokenizer is None:
-        # Fallback to placeholder if LLM components are not loaded
-        return {
+        print("ℹ️ LLM model/tokenizer not loaded. analyze_text will use placeholders.")
+        return { 
             'timestamp_info': timestamp_info, 'sentiment': {'label': 'neutral_simulated', 'score': 0.5},
             'emotions': ['simulated_emotion'], 'keywords': ['simulated', 'keywords'],
             'topics': ['simulated_topic'], 'humor_detected': False, 'controversy_detected': False,
-            'engagement_hooks': [], 'summary': "Simulated summary due to LLM not being available."
+            'engagement_hooks': [], 'summary': "Simulated summary: LLM not available."
         }
     
-    # print(f"🧠 Actual LLM: Analyzing text segment from {timestamp_info['start']:.1f}s to {timestamp_info['end']:.1f}s...")
-    # This is still a placeholder for actual LLM logic (sentiment, keywords etc.)
-    # For now, return dummy data but indicate it passed through the 'actual' path
-    return {
-        'timestamp_info': timestamp_info, 'sentiment': {'label': 'neutral_llm_placeholder', 'score': 0.6},
-        'emotions': ['curiosity_llm_placeholder'], 'keywords': ['llm', 'placeholder', 'text'],
-        'topics': ['llm_analysis_placeholder'], 'humor_detected': False, 'controversy_detected': False,
-        'engagement_hooks': ['question_placeholder?'], 'summary': f"LLM placeholder summary for segment."
-    }
-
+    try:
+        llm_pipeline_obj = pipeline(
+            "text-generation", 
+            model=_llm, 
+            tokenizer=_tokenizer, 
+            device_map=_llm.hf_device_map if hasattr(_llm, 'hf_device_map') else 'auto'
+        )
+        prompt = f"Analyze feelings, emotions, and keywords in the text: <<{transcript_segment}>>. Output labels: sentiment, emotions list, keywords list."
+        generated_outputs = llm_pipeline_obj(prompt, max_new_tokens=150, num_return_sequences=1, do_sample=False)
+        llm_raw_output = generated_outputs[0]['generated_text']
+        
+        return {
+            'timestamp_info': timestamp_info, 'llm_output': llm_raw_output, 
+            'sentiment': {'label': 'llm_needs_parsing', 'score': 0.5}, 
+            'emotions': ['llm_needs_parsing'], 'keywords': ['llm_needs_parsing'],
+            'topics': ['llm_needs_parsing'], 'summary': "LLM analysis (parsing needed)."
+        }
+    except Exception as e:
+        print(f"❌ ERROR during LLM text analysis pipeline: {e}")
+        return { 
+            'timestamp_info': timestamp_info, 'sentiment': {'label': 'error_in_llm_exec', 'score': 0.0},
+            'summary': f"Error in LLM exec: {e}"
+        }
+    
 def analyze_visuals(video_segment_path: str, timestamp_info: Dict) -> Dict:
     # video_segment_path is currently a dummy string like "dummy_path_for_segment_X_Y.mp4"
     # In a real scenario, this would be an actual path to a subclip or frames.
@@ -631,4 +660,3 @@ if __name__ == "__main__":
 #
 # Actual AI model accuracy and output quality testing is a separate, more involved process.
 # mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm mMmmMm #
-```
