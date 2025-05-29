@@ -29,73 +29,90 @@ import numpy as np
 import librosa
 import cv2
 from moviepy.video.io.ffmpeg_tools import ffmpeg_extract_subclip
-from typing import List, Dict, Optional 
+from typing import List, Dict, Optional
+import json # Added for parsing LLM JSON output
 from app.services.services.download_youtube_video import download_video
-import validators 
+import validators
 from transformers import BitsAndBytesConfig, pipeline
+import logging
+import argparse
+from rich.console import Console
+from rich.logging import RichHandler
 
-bnb_config = BitsAndBytesConfig(
+# --- Initialize Rich Console and Logging ---
+console = Console()
+LOG_LEVEL = logging.INFO # Default log level
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(message)s", # Rich handles formatting, so this is minimal
+    datefmt="[%X]", # Timestamp format
+    handlers=[RichHandler(console=console, rich_tracebacks=True, show_path=False, markup=True)] # Added markup=True
+)
+log = logging.getLogger("rich")
+# --- End Logging Setup ---
+
+# ───────── DEVICE CONFIGURATION ───────── #
+FORCE_CPU = os.getenv("FORCE_CPU", "0").lower() in ["1", "true"]
+if FORCE_CPU:
+    DEVICE = torch.device("cpu")
+    log.info("FORCE_CPU environment variable set. Using CPU.")
+elif torch.cuda.is_available():
+    DEVICE = torch.device("cuda")
+    log.info("CUDA is available. Using GPU.")
+else:
+    DEVICE = torch.device("cpu")
+    log.info("CUDA not available. Using CPU.")
+# ────────────────────────────────────────── #
+
+bnb_config_gpu = BitsAndBytesConfig( # Renamed for clarity, this is for GPU
     load_in_4bit=True,
     bnb_4bit_quant_type="nf4",
     bnb_4bit_compute_dtype=torch.float16
 )
+# For CPU, 4-bit quantization with bitsandbytes is often not supported or optimal.
+# bnb_config will be set dynamically in load_llm_model based on DEVICE.
+
 # Attempt to import AI models; handle ImportError if they are not installed
 try:
     from faster_whisper import WhisperModel
 except ImportError:
     WhisperModel = None # type: ignore
-    print("⚠️ WARNING: faster_whisper not installed. Transcription will be simulated if model cannot be loaded.")
+    log.warning("faster_whisper not installed. Transcription will be simulated if model cannot be loaded.")
 
 try:
     from transformers import AutoTokenizer, AutoModelForCausalLM
 except ImportError:
     AutoTokenizer = None # type: ignore
     AutoModelForCausalLM = None # type: ignore
-    print("⚠️ WARNING: transformers not installed. LLM-based text analysis will be simulated.")
+    log.warning("transformers not installed. LLM-based text analysis will be simulated.")
 
 try:
     # Assuming yolov5 is installed from a package that makes it importable
-    # This might vary depending on the specific YOLOv5 fork/package used.
-    # Common ways: from yolov5 import YOLOv5, or torch.hub.load(...)
-    # For this example, let's assume a hypothetical YOLOv5 class is available.
-    # If using torch.hub.load, the loading logic would be different.
     class YOLOv5Placeholder: # Placeholder if actual import fails or is complex
-        def __init__(self, weights, device): self.weights = weights; self.device = device; print(f"YOLOv5Placeholder initialized with weights: {weights}")
-        def predict(self, frame): print("YOLOv5Placeholder: predict called"); return [] 
+        def __init__(self, weights, device): self.weights = weights; self.device = device; log.info(f"YOLOv5Placeholder initialized with weights: {weights} on device: {device}")
+        def predict(self, frame): log.debug("YOLOv5Placeholder: predict called"); return [] 
     YOLOv5 = YOLOv5Placeholder # Default to placeholder
 
-    # Attempt to import a specific YOLOv5 package if available.
-    # This is speculative and depends on what 'pip install yolov5' provides.
-    # If a specific package is used, this import should match it.
-    # For example, if it's 'yolov5torch': from yolov5torch import YOLOv5Model as YOLOv5
-    # For now, we rely on the placeholder if no specific known 'yolov5' package is found.
-    # If torch.hub.load is preferred, that logic would replace this.
-    # Example of dynamic import attempt (adjust as needed for actual package):
     try:
-        from yolov5 import YOLOv5 as ActualYOLOv5 # Try a common name
+        from yolov5 import YOLOv5 as ActualYOLOv5 
         YOLOv5 = ActualYOLOv5
-        print("ℹ️  Successfully imported 'yolov5.YOLOv5'.")
+        log.info("Successfully imported 'yolov5.YOLOv5'.")
     except ImportError:
         try:
-            # Example for yolov5 from ultralytics hub
             import torch
-            _yolo_model_hub_temp = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
-            # This is just to check if torch.hub works, the actual model usage is below
-            print("ℹ️  Successfully checked torch.hub.load for ultralytics/yolov5.")
-            # Note: The actual _yolo_model will be loaded in load_vision_models using a specific path
+            _yolo_model_hub_temp = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True) 
+            log.info("Successfully checked torch.hub.load for ultralytics/yolov5.")
         except Exception as e_yolo_hub:
-            print(f"⚠️ WARNING: Could not import 'yolov5' or load from torch.hub ({e_yolo_hub}). YOLOv5 detection will be simulated by placeholder.")
+            log.warning(f"Could not import 'yolov5' or load from torch.hub ({e_yolo_hub}). YOLOv5 detection will be simulated by placeholder.")
 
 except ImportError:
-    # This top-level except is for the initial "class YOLOv5Placeholder" block
-    print("⚠️ WARNING: YOLOv5 related imports failed at placeholder definition. YOLOv5 detection will be simulated.")
-    # YOLOv5 remains YOLOv5Placeholder
+    log.warning("YOLOv5 related imports failed at placeholder definition. YOLOv5 detection will be simulated.")
 
 try:
     from fer import FER
 except ImportError:
     FER = None # type: ignore
-    print("⚠️ WARNING: fer (Facial Emotion Recognition) not installed. Emotion detection will be simulated.")
+    log.warning("fer (Facial Emotion Recognition) not installed. Emotion detection will be simulated.")
 
 
 # Global variables for models (to be loaded once)
@@ -106,145 +123,184 @@ _yolo_model = None
 _fer_detector = None
 
 # ───────── DIRECTORIES AND CONFIGS ───────── #
-MODELS_DIR = "models" # For locally stored/downloaded models by this script
-# Ensure this script is in a subdirectory of the main app for this path to work as intended
-# Or use absolute paths / more robust path construction.
+MODELS_DIR = "models" 
 # For example: os.path.join(os.path.dirname(__file__), "models")
 
 # ───────── CONFIGURACIÓN BÁSICA (Copied from previous state) ───────── #
 TARGET_CLIPS = 10
 WIN_SIZE     = 1.0
-MIN_CLIP_LEN = 60
-MAX_CLIP_LEN = 90
+MIN_CLIP_LEN = 10 
+MAX_CLIP_LEN = 35 
 AUDIO_W      = 2.0
 MOTION_W     = 1.0
 
 # ───────── AI MODEL CONFIGURATION ───────── #
-MODEL_PATH_STT = "openai/whisper-small" # Now directly Hugging Face model ID
-MODEL_PATH_LLM = "meta-llama/Llama-2-7b-chat-hf"
-MODEL_PATH_VISION_YOLO = "yolov5s.pt" # Will be joined with MODELS_DIR
+MODEL_PATH_STT = "small.en" 
+LLM_MODEL_PRIMARY = "meta-llama/Llama-2-7b-chat-hf"
+LLM_MODEL_FALLBACK_OPEN = "mistralai/Mistral-7B-Instruct-v0.2" 
+LLM_MODEL_FALLBACK_SMALL = "distilgpt2" 
+MODEL_PATH_VISION_YOLO = "yolov5s.pt" 
 # ────────────────────────────────────────── #
 
 # ───────── VIRALITY SCORING CONFIGURATION (Copied from previous state) ───────── #
 VIRALITY_CONFIG = {
     'weights': {
-        'sentiment_positive': 1.5, 'sentiment_negative': 0.8, 'emotion_joy': 1.2,
-        'emotion_surprise': 1.3, 'keyword_match': 2.0, 'engagement_hook': 1.5,
-        'visual_intensity': 1.0, 'facial_expression_happy': 1.2, 'fast_cuts_or_action': 1.1,
-        'audio_energy_avg': 0.5, 'motion_avg': 0.3,
+        'sentiment_positive': 1.2, 
+        'sentiment_negative': 0.8,
+        'emotion_joy': 1.2,
+        'emotion_surprise': 1.5, 
+        'keyword_match': 1.5,  
+        'engagement_hook': 1.5,
+        'visual_intensity': 1.0,
+        'facial_expression_happy': 1.2,
+        'fast_cuts_or_action': 1.1,
+        'audio_energy_avg': 0.5,
+        'motion_avg': 0.3,
+        'vertical_cropability': 1.5 
     },
     'thresholds': {'min_sentiment_score': 0.5, 'min_visual_intensity': 0.2,},
     'trending_keywords': ['challenge', 'hack', 'reveal', 'shocking', 'must-see']
 }
 # ─────────────────────────────────────────────────── #
 
-# ─── VRAM & EFFICIENCY STRATEGY (Copied from previous state) ─── #
-# Given the 16GB VRAM constraint, running multiple large AI models simultaneously
-# might be challenging. A sequential processing strategy could be:
-# 1. Transcribe full video with STT (once).
-# 2. For each candidate segment identified by `best_segments`:
-#    a. Load/run Text Analysis (LLM). Unload LLM if VRAM is needed.
-#    b. Load/run Visual Analysis (Vision Model). Unload Vision Model.
-# This minimizes peak VRAM usage by not holding all models at once.
-# The `analyze_text` and `analyze_visuals` functions would then handle
-# their own model loading/unloading if this strategy is adopted,
-# or models could be passed as arguments if managed centrally.
-# ─────────────────────────────────────────────────── #
-
 # ───────── MODEL LOADING FUNCTIONS ───────── #
 def load_stt_model():
     global _stt_model
     if WhisperModel is None:
-        print("ℹ️ faster_whisper library not available. STT model cannot be loaded. Transcription will be simulated.")
+        log.warning("faster_whisper library not available. STT model cannot be loaded. Transcription will be simulated.")
         return
 
     if _stt_model is None:
         try:
-            print(f"🧠 Loading STT model: {MODEL_PATH_STT} (will download if not cached)...")
-            # Model will be downloaded from Hugging Face if not cached.
+            log.info(f"🧠 Loading STT model: {MODEL_PATH_STT} (will download if not cached)...")
             _stt_model = WhisperModel(
-                model_size_or_path="openai/whisper-small", # Using direct model ID
-                device="cuda",
-                compute_type="float16",
-                local_files_only=False # Allow model download if not cached
+                model_size_or_path=MODEL_PATH_STT,
+                device=DEVICE.type, 
+                compute_type="int8", 
+                local_files_only=False,
             )
-            print("✅ STT Model loaded successfully.")
+            log.info(f"✅ STT Model loaded successfully on [magenta]{DEVICE.type}[/magenta].")
         except Exception as e:
-            print(f"❌ ERROR loading STT model: {e}")
-            print("Transcription will be simulated.")
+            log.error(f"❌ ERROR loading STT model ({MODEL_PATH_STT}) on {DEVICE.type}: {e}", exc_info=True)
+            log.warning("    Ensure 'faster_whisper' is installed correctly and model files can be downloaded/accessed.")
+            log.warning("    Transcription will be simulated.")
             _stt_model = None
 
 def load_llm_model():
-    global _llm, _tokenizer # Global model variables
-    
-    if 'AutoTokenizer' not in globals() or AutoTokenizer is None or \
-       'AutoModelForCausalLM' not in globals() or AutoModelForCausalLM is None or \
-       'BitsAndBytesConfig' not in globals() or BitsAndBytesConfig is None:
-        print("ℹ️ Key transformers components not available. LLM cannot be loaded.")
+    global _llm, _tokenizer
+    if _llm is not None and _tokenizer is not None:
+        log.info("ℹ️ LLM model and tokenizer already loaded.")
         return
 
-    if _llm is None or _tokenizer is None: # Only load if not already loaded
+    if not all(c in globals() and globals()[c] is not None for c in ['AutoTokenizer', 'AutoModelForCausalLM', 'BitsAndBytesConfig']):
+        log.warning("⚠️ Key transformers components (AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig) not available. LLM loading skipped.")
+        _llm, _tokenizer = None, None
+        return
+
+    os.makedirs(MODELS_DIR, exist_ok=True)
+    hf_token = os.getenv("HF_TOKEN")
+    
+    current_quant_config = bnb_config_gpu if DEVICE.type == "cuda" else None
+
+    # Attempt 1: Llama-2 (Primary)
+    if hf_token and DEVICE.type == "cuda": 
+        log.info(f"🧠 Attempting to load Primary LLM: {LLM_MODEL_PRIMARY} (4-bit with HF_TOKEN on GPU)...")
         try:
-            os.makedirs(MODELS_DIR, exist_ok=True)
-            print(f"🧠 Loading LLM model and tokenizer: {MODEL_PATH_LLM} (Llama-2, 4-bit)...")
-            _tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH_LLM, cache_dir=MODELS_DIR)
+            _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_PRIMARY, cache_dir=MODELS_DIR, token=hf_token)
             _llm = AutoModelForCausalLM.from_pretrained(
-                MODEL_PATH_LLM,
-                quantization_config=bnb_config,
-                device_map="auto",
+                LLM_MODEL_PRIMARY,
+                quantization_config=current_quant_config,
+                device_map="auto", 
+                cache_dir=MODELS_DIR,
+                token=hf_token,
+                trust_remote_code=True
+            )
+            log.info(f"✅ LLM model ({LLM_MODEL_PRIMARY}) and tokenizer loaded successfully on GPU.")
+            return
+        except Exception as e:
+            log.error(f"❌ ERROR loading Primary LLM ({LLM_MODEL_PRIMARY}) on GPU: {e}. Trying fallback.", exc_info=True)
+            _llm, _tokenizer = None, None 
+    elif hf_token and DEVICE.type == "cpu":
+        log.info(f"ℹ️ Primary LLM {LLM_MODEL_PRIMARY} is configured for GPU (4-bit). Skipping on CPU for this model.")
+    elif not hf_token:
+        log.info("ℹ️ HF_TOKEN not found. Skipping Primary LLM (Llama-2).")
+
+    # Attempt 2: Open Source Fallback
+    log.info(f"🧠 Attempting to load Open Fallback LLM: {LLM_MODEL_FALLBACK_OPEN} on [magenta]{DEVICE.type}[/magenta]...")
+    try: 
+        _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_FALLBACK_OPEN, cache_dir=MODELS_DIR)
+        if DEVICE.type == "cuda":
+            log.info(f"   Trying {LLM_MODEL_FALLBACK_OPEN} with 4-bit quantization on GPU...")
+            _llm = AutoModelForCausalLM.from_pretrained(
+                LLM_MODEL_FALLBACK_OPEN,
+                quantization_config=current_quant_config, 
+                device_map="auto", 
                 cache_dir=MODELS_DIR,
                 trust_remote_code=True
             )
-            print(f"✅ LLM model ({MODEL_PATH_LLM}) and tokenizer loaded successfully.")
-        except Exception as e:
-            print(f"❌ ERROR loading LLM model ({MODEL_PATH_LLM}): {e}")
-            print("    Ensure you have accepted Llama-2's license on Hugging Face.")
-            print("    Ensure 'bitsandbytes' and 'accelerate' are installed.")
-            _llm, _tokenizer = None, None
+            log.info(f"✅ LLM model ({LLM_MODEL_FALLBACK_OPEN}) with 4-bit quantization loaded successfully on GPU.")
+        else: # CPU
+            log.info(f"   Trying {LLM_MODEL_FALLBACK_OPEN} on CPU (no explicit BitsAndBytes quantization)...")
+            _llm = AutoModelForCausalLM.from_pretrained(
+                LLM_MODEL_FALLBACK_OPEN,
+                cache_dir=MODELS_DIR,
+                trust_remote_code=True
+            ).to(DEVICE) 
+            log.info(f"✅ LLM model ({LLM_MODEL_FALLBACK_OPEN}) loaded successfully on CPU.")
+        return
+    except Exception as e_fallback:
+        log.error(f"❌ ERROR loading Open Fallback LLM ({LLM_MODEL_FALLBACK_OPEN}) on {DEVICE.type}: {e_fallback}. Trying small fallback.", exc_info=True)
+        _llm, _tokenizer = None, None
+
+    # Attempt 3: Small Fallback
+    log.info(f"🧠 Attempting to load Small Fallback LLM: {LLM_MODEL_FALLBACK_SMALL} on [magenta]{DEVICE.type}[/magenta]...")
+    try:
+        _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_FALLBACK_SMALL, cache_dir=MODELS_DIR)
+        _llm = AutoModelForCausalLM.from_pretrained(
+            LLM_MODEL_FALLBACK_SMALL,
+            cache_dir=MODELS_DIR,
+            trust_remote_code=True
+        ).to(DEVICE) 
+        log.info(f"✅ LLM model ({LLM_MODEL_FALLBACK_SMALL}) and tokenizer loaded successfully on {DEVICE.type}.")
+        return
+    except Exception as e:
+        log.error(f"❌ ERROR loading Small Fallback LLM ({LLM_MODEL_FALLBACK_SMALL}): {e}.", exc_info=True)
+        _llm, _tokenizer = None, None
+
+    if _llm is None or _tokenizer is None:
+        log.error("❌ All LLM loading attempts failed. Text analysis will be simulated.")
 
 def load_vision_models():
     global _yolo_model, _fer_detector
-    os.makedirs(MODELS_DIR, exist_ok=True) # Ensure models directory exists
+    os.makedirs(MODELS_DIR, exist_ok=True) 
 
-    # Load YOLOv5
     if _yolo_model is None:
+        yolo_weights_path = os.path.join(MODELS_DIR, MODEL_PATH_VISION_YOLO)
         try:
-            print(f"🧠 Loading YOLOv5 model...")
-            # For YOLOv5:
-            # This setup expects 'yolov5s.pt' to be manually placed in MODELS_DIR.
-            # Some yolov5 pip packages might download if 'yolov5s' (standard name) is given.
-            # Check your specific yolov5 library's behavior for auto-downloading.
-            yolo_weights_path = os.path.join(MODELS_DIR, 'yolov5s.pt') 
-            
-            if not os.path.exists(yolo_weights_path):
-                print(f"⚠️ WARNING: YOLOv5 weights file '{yolo_weights_path}' not found.")
-                print(f"Attempting to load 'yolov5s' (may trigger download by torch.hub if not cached)...")
-                # This relies on torch.hub's caching mechanism.
-                # The 'yolov5s' model is a standard small model.
-                _yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
-                # If specific weights are required, they must be placed manually,
-                # or a direct download link + subprocess call could be added here.
+            if os.path.exists(yolo_weights_path):
+                log.info(f"🧠 Loading YOLOv5 model from local path: {yolo_weights_path}...")
+                _yolo_model = torch.hub.load('ultralytics/yolov5', 'custom', path=yolo_weights_path, trust_repo=True)
             else:
-                 _yolo_model = torch.hub.load('ultralytics/yolov5', 'custom', path=yolo_weights_path, trust_repo=True)
-
-            if hasattr(_yolo_model, 'to'): _yolo_model.to('cuda') # Move to GPU if applicable
-            print("✅ YOLOv5 Model loaded successfully.")
+                log.warning(f"⚠️ YOLOv5 weights '{yolo_weights_path}' not found locally.")
+                log.info(f"🧠 Attempting to download and load 'yolov5s' from torch.hub...")
+                _yolo_model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True, trust_repo=True)
+            
+            _yolo_model.to(DEVICE) 
+            log.info(f"✅ YOLOv5 Model loaded successfully on [magenta]{DEVICE.type}[/magenta].")
         except Exception as e:
-            print(f"❌ ERROR loading YOLOv5 model: {e}")
-            print("YOLOv5 detection will be simulated by placeholder.")
-            _yolo_model = YOLOv5Placeholder(weights="N/A", device="cpu") # Fallback to placeholder
+            log.error(f"❌ ERROR loading YOLOv5 model: {e}", exc_info=True)
+            log.warning("YOLOv5 detection will be simulated by placeholder.")
+            _yolo_model = YOLOv5Placeholder(weights="N/A", device=DEVICE.type) 
 
-    # Load FER
     if FER is not None and _fer_detector is None:
         try:
-            print(f"🧠 Loading FER model (MTCNN and emotion classifier)...")
-            # For FER:
-            # The FER library typically auto-downloads required models (MTCNN, emotion classifier) on first use.
-            _fer_detector = FER(mtcnn=True) # mtcnn=True for more accurate face detection
-            print("✅ FER Model loaded successfully.")
+            fer_device_type = DEVICE.type 
+            log.info(f"🧠 Loading FER model (MTCNN and emotion classifier) on [magenta]{fer_device_type}[/magenta]...")
+            _fer_detector = FER(mtcnn=True, device=fer_device_type) 
+            log.info(f"✅ FER Model loaded successfully on its determined device (attempted [magenta]{fer_device_type}[/magenta]).")
         except Exception as e:
-            print(f"❌ ERROR loading FER model: {e}")
-            print("Facial emotion recognition will be simulated.")
+            log.error(f"❌ ERROR loading FER model on {DEVICE.type}: {e}", exc_info=True)
+            log.warning("Facial emotion recognition will be simulated.")
             _fer_detector = None
 # ─────────────────────────────────────────── #
 
@@ -265,10 +321,16 @@ def audio_peaks(video_path: str, win: float) -> np.ndarray:
 
 def motion_peaks(video_path: str, win: float) -> np.ndarray:
     cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        log.error(f"Failed to open video: [cyan]{video_path}[/cyan] in motion_peaks.")
+        return np.array([])
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps == 0: print("⚠️ Warning: Could not get FPS from video. Motion analysis might be incorrect."); return np.array([])
+    if fps == 0: 
+        log.warning(f"Could not get FPS from video [cyan]{video_path}[/cyan]. Motion analysis might be incorrect.")
+        cap.release() 
+        return np.array([])
     step = int(fps * win)
-    if step == 0: step = int(fps) # Default to 1s window if win_size is too small for FPS
+    if step == 0: step = int(fps) 
     
     prev = None; mvals = []; idx = 0
     while True:
@@ -287,10 +349,10 @@ def motion_peaks(video_path: str, win: float) -> np.ndarray:
 
 def transcribe_video(video_path: str) -> List[Dict]:
     if _stt_model is None:
-        print(f"ℹ️  STT Model not loaded or failed to load. Simulating transcription for {video_path}")
+        log.warning(f"STT Model not loaded or failed to load. Simulating transcription for [cyan]{video_path}[/cyan]")
         return [{'start_time': 0.0, 'end_time': 5.0, 'text': 'Simulated: STT model not available.'}]
 
-    print(f"🎙️  Actual STT: Transcribing {video_path}...")
+    log.info(f"🎙️  Actual STT: Transcribing [cyan]{video_path}[/cyan]...")
     audio_output_path = "" 
     try:
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp_audio:
@@ -298,11 +360,11 @@ def transcribe_video(video_path: str) -> List[Dict]:
         
         subprocess.run(
             ["ffmpeg", "-y", "-i", video_path, "-vn", "-ac", "1", "-ar", "16000", audio_output_path],
-            capture_output=True, check=True, timeout=180 # 3 min timeout for audio extraction
+            capture_output=True, check=True, timeout=180 
         )
 
         segments_generator, info = _stt_model.transcribe(audio_output_path, beam_size=5)
-        print(f"Detected language '{info.language}' with probability {info.language_probability:.2f}")
+        log.info(f"Detected language '[italic yellow]{info.language}[/italic yellow]' with probability {info.language_probability:.2f}")
         
         transcript_data = []
         for segment in segments_generator:
@@ -312,83 +374,244 @@ def transcribe_video(video_path: str) -> List[Dict]:
                 "text": segment.text.strip()
             })
         
-        print("✅ Actual STT: Transcription complete.")
+        log.info("✅ Actual STT: Transcription complete.")
         return transcript_data
     except subprocess.TimeoutExpired:
-        print(f"❌ ERROR: Timeout during ffmpeg audio extraction for STT from {video_path}.")
-        print("Falling back to simulated transcription.")
+        log.error(f"Timeout during ffmpeg audio extraction for STT from [cyan]{video_path}[/cyan].", exc_info=True)
+        log.warning("Falling back to simulated transcription.")
         return [{'start_time': 0.0, 'end_time': 5.0, 'text': 'Simulated: Timeout during audio extraction for STT.'}]
     except Exception as e:
-        print(f"❌ ERROR during actual STT transcription: {e}")
-        print("Falling back to simulated transcription.")
+        log.error(f"ERROR during actual STT transcription for [cyan]{video_path}[/cyan]: {e}", exc_info=True)
+        log.warning("Falling back to simulated transcription.")
         return [{'start_time': 0.0, 'end_time': 5.0, 'text': 'Simulated: Error during STT.'}]
     finally:
         if audio_output_path and os.path.exists(audio_output_path):
             try: os.remove(audio_output_path)
-            except Exception as e_rem: print(f"Error removing temp audio file {audio_output_path}: {e_rem}")
+            except Exception as e_rem: log.error(f"Error removing temp audio file [cyan]{audio_output_path}[/cyan]: {e_rem}", exc_info=True)
 
 def analyze_text(transcript_segment: str, timestamp_info: Dict) -> Dict:
-    # TODO: Implement robust parsing of LLM output for structured data.
-    if _llm is None or _tokenizer is None:
-        print("ℹ️ LLM model/tokenizer not loaded. analyze_text will use placeholders.")
-        return { 
-            'timestamp_info': timestamp_info, 'sentiment': {'label': 'neutral_simulated', 'score': 0.5},
-            'emotions': ['simulated_emotion'], 'keywords': ['simulated', 'keywords'],
-            'topics': ['simulated_topic'], 'humor_detected': False, 'controversy_detected': False,
-            'engagement_hooks': [], 'summary': "Simulated summary: LLM not available."
-        }
-    
-    try:
-        llm_pipeline_obj = pipeline(
-            "text-generation", 
-            model=_llm, 
-            tokenizer=_tokenizer, 
-            device_map=_llm.hf_device_map if hasattr(_llm, 'hf_device_map') else 'auto'
-        )
-        prompt = f"Analyze feelings, emotions, and keywords in the text: <<{transcript_segment}>>. Output labels: sentiment, emotions list, keywords list."
-        generated_outputs = llm_pipeline_obj(prompt, max_new_tokens=150, num_return_sequences=1, do_sample=False)
-        llm_raw_output = generated_outputs[0]['generated_text']
-        
-        return {
-            'timestamp_info': timestamp_info, 'llm_output': llm_raw_output, 
-            'sentiment': {'label': 'llm_needs_parsing', 'score': 0.5}, 
-            'emotions': ['llm_needs_parsing'], 'keywords': ['llm_needs_parsing'],
-            'topics': ['llm_needs_parsing'], 'summary': "LLM analysis (parsing needed)."
-        }
-    except Exception as e:
-        print(f"❌ ERROR during LLM text analysis pipeline: {e}")
-        return { 
-            'timestamp_info': timestamp_info, 'sentiment': {'label': 'error_in_llm_exec', 'score': 0.0},
-            'summary': f"Error in LLM exec: {e}"
-        }
-    
-def analyze_visuals(video_segment_path: str, timestamp_info: Dict) -> Dict:
-    # video_segment_path is currently a dummy string like "dummy_path_for_segment_X_Y.mp4"
-    # In a real scenario, this would be an actual path to a subclip or frames.
-    
-    yolo_results_placeholder = []
-    fer_results_placeholder = []
+    default_response = {
+        'timestamp_info': timestamp_info,
+        'sentiment': {'label': 'neutral_simulated', 'score': 0.5},
+        'emotions': ['simulated_emotion'],
+        'keywords': ['simulated', 'keywords'],
+        'raw_llm_output': '',
+        'summary': "Simulated summary: LLM not available or error during processing."
+    }
 
-    if _yolo_model is not None and not isinstance(_yolo_model, YOLOv5Placeholder):
-        # Placeholder: actual YOLO processing would happen on frames from video_segment_path
-        # print(f"👁️ Actual YOLO: Analyzing visuals in {video_segment_path} (placeholder call)")
-        yolo_results_placeholder = [{'object': 'person_yolo_placeholder', 'confidence': 0.8, 'bbox': [0,0,0,0]}]
+    if _llm is None or _tokenizer is None:
+        log.warning("LLM model/tokenizer not loaded for text analysis. Using placeholders.")
+        return default_response
+
+    prompt = f"""Analyze the following text and provide:
+1. Sentiment (positive, negative, neutral) and a confidence score (0.0-1.0).
+2. A list of up to 3 dominant emotions (e.g., joy, sadness, anger, surprise).
+3. A list of up to 5 relevant keywords.
+
+Format your response as a JSON object like this:
+{{
+  "sentiment": {{"label": "positive", "score": 0.9}},
+  "emotions": ["joy", "excitement"],
+  "keywords": ["event", "announcement", "new"]
+}}
+
+Text: "<<{transcript_segment}>>"
+"""
+    llm_raw_output = ""
+    try:
+        text_gen_pipeline = pipeline(
+            "text-generation",
+            model=_llm,
+            tokenizer=_tokenizer,
+            pipeline_device = -1 
+            if hasattr(_llm, 'device') and _llm.device is not None: 
+                 if _llm.device.type == "cuda": pipeline_device = _llm.device.index if _llm.device.index is not None else 0
+            elif DEVICE.type == "cuda": 
+                 pipeline_device = 0
+            
+            device=pipeline_device
+        )
+        
+        outputs = text_gen_pipeline(prompt, max_new_tokens=200, do_sample=False, temperature=0.0, top_k=1)
+        
+        if outputs and isinstance(outputs, list) and 'generated_text' in outputs[0]:
+            llm_raw_output = outputs[0]['generated_text']
+            if prompt in llm_raw_output:
+                llm_raw_output = llm_raw_output.split(prompt)[-1].strip() 
+            
+            try:
+                json_match = None
+                if "```json" in llm_raw_output:
+                    json_str = llm_raw_output.split("```json")[-1].split("```")[0].strip()
+                    json_match = json.loads(json_str)
+                elif "{" in llm_raw_output and "}" in llm_raw_output:
+                    start_index = llm_raw_output.find("{")
+                    end_index = llm_raw_output.rfind("}") + 1
+                    if start_index != -1 and end_index != -1:
+                         json_str = llm_raw_output[start_index:end_index]
+                         json_match = json.loads(json_str)
+
+                if json_match and isinstance(json_match, dict):
+                    sentiment = json_match.get('sentiment', default_response['sentiment'])
+                    emotions = json_match.get('emotions', default_response['emotions'])
+                    keywords = json_match.get('keywords', default_response['keywords'])
+                    
+                    if not (isinstance(sentiment, dict) and 'label' in sentiment and 'score' in sentiment):
+                        sentiment = default_response['sentiment']
+                    if not (isinstance(emotions, list)): emotions = default_response['emotions']
+                    if not (isinstance(keywords, list)): keywords = default_response['keywords']
+
+                    return {
+                        'timestamp_info': timestamp_info,
+                        'sentiment': sentiment,
+                        'emotions': emotions,
+                        'keywords': keywords,
+                        'raw_llm_output': llm_raw_output,
+                        'summary': "LLM analysis complete (parsed successfully)."
+                    }
+                else: 
+                    raise ValueError("Parsed JSON is not a valid dictionary or not found.")
+
+            except Exception as e_parse:
+                log.warning(f"Could not parse JSON from LLM output: {e_parse}", exc_info=False) 
+                log.debug(f"   LLM Raw Output for parsing failure: {llm_raw_output}")
+                return {
+                    'timestamp_info': timestamp_info,
+                    'sentiment': default_response['sentiment'], 'emotions': default_response['emotions'], 'keywords': default_response['keywords'],
+                    'raw_llm_output': llm_raw_output,
+                    'summary': f"LLM analysis complete (JSON parsing failed: {e_parse})."
+                }
+        else:
+            llm_raw_output = "No output from LLM pipeline."
+            raise ValueError(llm_raw_output)
+
+    except Exception as e_pipeline:
+        log.error(f"ERROR during LLM text analysis pipeline: {e_pipeline}", exc_info=True)
+        return {
+            'timestamp_info': timestamp_info,
+            'sentiment': default_response['sentiment'], 'emotions': default_response['emotions'], 'keywords': default_response['keywords'],
+            'raw_llm_output': llm_raw_output, 
+            'summary': f"Error in LLM execution: {e_pipeline}"
+        }
+
+def analyze_visuals(full_video_path: str, timestamp_info: Dict, frames_to_process: int = 3) -> Dict:
+    simulated_yolo = [{'object': 'simulated_object', 'confidence': 0.0, 'bbox': [0,0,0,0]}]
+    simulated_fer = [{'box': [0,0,0,0], 'emotions': {'neutral_simulated': 1.0}}]
+    default_frame_dims = {'width': 1920, 'height': 1080} 
+    default_response = {
+        'timestamp_info': timestamp_info,
+        'key_objects': simulated_yolo,
+        'facial_expressions': simulated_fer,
+        'frame_dimensions': default_frame_dims, 
+        'visual_intensity_score': 0.1, 
+        'notes': "Visual analysis simulated: Models not loaded or error during processing."
+    }
+
+    if (_yolo_model is None or isinstance(_yolo_model, YOLOv5Placeholder)) and \
+       (_fer_detector is None):
+        log.warning(f"Vision models (YOLO & FER) not loaded for visual analysis of [cyan]{full_video_path}[/cyan]. Using placeholders.")
+        return default_response
+
+    cap = cv2.VideoCapture(full_video_path)
+    if not cap.isOpened():
+        log.error(f"Could not open video file [cyan]{full_video_path}[/cyan] for visual analysis.")
+        default_response['notes'] = f"Error: Could not open video {full_video_path}."
+        return default_response
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps == 0: 
+        log.warning(f"Video FPS is 0 for [cyan]{full_video_path}[/cyan]. Attempting to use a default FPS of 25, but timing might be inaccurate.")
+        fps = 25 
+
+    segment_start_time = timestamp_info['start']
+    segment_end_time = timestamp_info['end']
+    segment_duration = segment_end_time - segment_start_time
+
+    processed_frames_yolo = []
+    processed_frames_fer = []
+    frame_width, frame_height = default_frame_dims['width'], default_frame_dims['height'] 
     
-    if _fer_detector is not None:
-        # Placeholder: actual FER processing would happen on frames with detected faces
-        # print(f"😊 Actual FER: Analyzing emotions in {video_segment_path} (placeholder call)")
-        fer_results_placeholder = [{'box': [0,0,0,0], 'emotions': {'happy_fer_placeholder': 0.7, 'neutral': 0.3}}]
+    frames_captured_for_segment = 0
+    first_processed_frame_dims_captured = False
+
+    try:
+        frame_indices_to_sample = []
+        if segment_duration > 0 and frames_to_process > 0:
+            time_points = np.linspace(segment_start_time, segment_end_time, frames_to_process)
+            frame_indices_to_sample = [int(t * fps) for t in time_points]
+        
+        current_frame_idx = 0
+        
+        if frame_indices_to_sample:
+            while cap.isOpened():
+                ret, frame = cap.read()
+                if not ret:
+                    break 
+                
+                if current_frame_idx in frame_indices_to_sample:
+                    frames_captured_for_segment +=1
+                    
+                    if not first_processed_frame_dims_captured:
+                        h_cap, w_cap = frame.shape[:2]
+                        if h_cap > 0 and w_cap > 0: 
+                            frame_height, frame_width = h_cap, w_cap
+                            first_processed_frame_dims_captured = True
+
+                    if _yolo_model is not None and not isinstance(_yolo_model, YOLOv5Placeholder):
+                        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) 
+                        results = _yolo_model(frame_rgb)
+                        for det in results.xyxy[0].cpu().numpy(): 
+                            processed_frames_yolo.append({
+                                'class': _yolo_model.names[int(det[5])],
+                                'confidence': float(det[4]),
+                                'bbox': [float(c) for c in det[:4]] 
+                            })
+                    
+                    if _fer_detector is not None:
+                        emotions_in_frame = _fer_detector.detect_emotions(frame)
+                        for face_emotion in emotions_in_frame:
+                            processed_frames_fer.append({
+                                'box': face_emotion['box'], 
+                                'emotions': face_emotion['emotions'] 
+                            })
+                
+                current_frame_idx += 1
+                if frames_captured_for_segment >= len(frame_indices_to_sample) and len(frame_indices_to_sample) > 0 :
+                    break 
+                if current_frame_idx > max(frame_indices_to_sample, default=0) + int(fps) and len(frame_indices_to_sample) > 0: 
+                    log.warning(f"Safety break in frame processing for [cyan]{full_video_path}[/cyan] at segment {timestamp_info}")
+                    break
+    except Exception as e:
+        log.error(f"ERROR during visual analysis frame processing for [cyan]{full_video_path}[/cyan]: {e}", exc_info=True)
+        default_response['notes'] = f"Error during visual frame processing: {e}"
+    finally:
+        cap.release()
+
+    final_yolo_results = processed_frames_yolo if processed_frames_yolo else simulated_yolo
+    final_fer_results = processed_frames_fer if processed_frames_fer else simulated_fer
+    
+    notes = "Visual analysis complete."
+    if not processed_frames_yolo and (_yolo_model is None or isinstance(_yolo_model, YOLOv5Placeholder)):
+        notes += " YOLO not run (model not loaded)."
+    elif not processed_frames_yolo:
+        notes += " No objects detected by YOLO or no frames processed."
+        
+    if not processed_frames_fer and _fer_detector is None:
+        notes += " FER not run (model not loaded)."
+    elif not processed_frames_fer:
+        notes += " No faces detected by FER or no frames processed."
+
+    if not frames_captured_for_segment and frame_indices_to_sample :
+         notes += " No frames were actually captured or processed for the segment."
 
     return {
         'timestamp_info': timestamp_info,
-        'facial_expressions': fer_results_placeholder if _fer_detector else [{'expression': 'simulated_neutral', 'confidence': 0.5}],
-        'detected_actions': [], 
-        'key_objects': yolo_results_placeholder if _yolo_model and not isinstance(_yolo_model, YOLOv5Placeholder) else [{'object': 'simulated_object'}],
-        'scene_changes': [{'type': 'simulated_cut', 'timestamp': timestamp_info['start'] + 1.0}],
-        'visual_intensity_score': 0.4, # Slightly different from pure dummy
-        'notes': f"Visual analysis (actual models placeholder) for segment."
+        'key_objects': final_yolo_results,
+        'facial_expressions': final_fer_results,
+        'frame_dimensions': {'width': frame_width, 'height': frame_height} if first_processed_frame_dims_captured else default_frame_dims,
+        'visual_intensity_score': 0.5 if (processed_frames_yolo or processed_frames_fer) else 0.1, 
+        'notes': notes
     }
-
 
 def calculate_virality_score(
     text_analysis: Dict, visual_analysis: Dict,
@@ -409,17 +632,71 @@ def calculate_virality_score(
     if visual_analysis:
         visual_intensity = visual_analysis.get('visual_intensity_score', 0.0)
         if visual_intensity > thresholds.get('min_visual_intensity', 0.1): score += visual_intensity * weights.get('visual_intensity', 1.0)
-        # Simplified example for facial expression scoring from FER results
+        
         for face in visual_analysis.get('facial_expressions', []):
-            if isinstance(face, dict) and 'emotions' in face: # Check if it's a FER-like dict
-                if face['emotions'].get('happy_fer_placeholder', 0.0) > 0.5: # Example check
-                     score += weights.get('facial_expression_happy', 1.0)
-            elif isinstance(face, dict) and face.get('expression') == 'happy': # For older placeholder
+            if isinstance(face, dict) and 'emotions' in face:
+                if face['emotions'].get('happy', 0.0) > 0.5 or face['emotions'].get('surprise', 0.0) > 0.3: 
+                     score += weights.get('facial_expression_happy', 1.0) 
+            elif isinstance(face, dict) and face.get('expression') == 'happy': 
                  score += weights.get('facial_expression_happy', 1.0)
 
-        if len(visual_analysis.get('scene_changes', [])) > 2: score += weights.get('fast_cuts_or_action', 1.0)
-    score += segment_audio_avg_rms * weights.get('audio_energy_avg', 0.1)
-    score += segment_motion_avg_score * weights.get('motion_avg', 0.1)
+        if len(visual_analysis.get('scene_changes', [])) > 2 : score += weights.get('fast_cuts_or_action', 1.0) 
+
+        vertical_cropability_score = 0.0
+        key_objects = visual_analysis.get('key_objects', [])
+        frame_dims = visual_analysis.get('frame_dimensions')
+
+        if frame_dims and frame_dims.get('width', 0) > 0 and frame_dims.get('height', 0) > 0:
+            frame_width = frame_dims['width']
+            frame_height = frame_dims['height']
+            
+            main_subject = None
+            persons = [obj for obj in key_objects if obj.get('class') == 'person' and obj.get('confidence', 0) > 0.3]
+            if persons:
+                persons.sort(key=lambda p: (p['bbox'][2] - p['bbox'][0]) * (p['bbox'][3] - p['bbox'][1]), reverse=True) 
+                main_subject = persons[0]
+            elif key_objects and key_objects[0].get('confidence',0) > 0: 
+                valid_objects = [obj for obj in key_objects if obj.get('confidence', 0) > 0.0 and 'simulated' not in obj.get('class','')]
+                if valid_objects:
+                    valid_objects.sort(key=lambda p: (p['bbox'][2] - p['bbox'][0]) * (p['bbox'][3] - p['bbox'][1]), reverse=True)
+                    main_subject = valid_objects[0]
+
+            if main_subject:
+                x1, y1, x2, y2 = main_subject['bbox']
+                subj_center_x = (x1 + x2) / 2
+                
+                target_aspect_ratio = 9/16
+                current_aspect_ratio = frame_width / frame_height
+
+                if current_aspect_ratio > target_aspect_ratio: 
+                    crop_height = frame_height
+                    crop_width = crop_height * target_aspect_ratio
+                else: 
+                    crop_width = frame_width
+                    crop_height = crop_width / target_aspect_ratio 
+                
+                crop_x1 = subj_center_x - crop_width / 2
+                crop_x2 = subj_center_x + crop_width / 2
+                
+                crop_x1 = max(0, crop_x1)
+                crop_x2 = min(frame_width, crop_x2)
+
+                overlap_x1 = max(x1, crop_x1)
+                overlap_x2 = min(x2, crop_x2)
+                
+                overlap_width = max(0, overlap_x2 - overlap_x1)
+                subject_width = x2 - x1
+                
+                if subject_width > 0:
+                    coverage = overlap_width / subject_width
+                    vertical_cropability_score = coverage
+
+            score += vertical_cropability_score * weights.get('vertical_cropability', 1.5)
+        else:
+            if not frame_dims or frame_dims.get('width',0) == 0 : log.warning("Frame dimensions not available for cropability score calculation.")
+
+    score += segment_audio_avg_rms * weights.get('audio_energy_avg', 0.1) 
+    score += segment_motion_avg_score * weights.get('motion_avg', 0.1) 
     return round(score, 2)
 
 def combined_score( 
@@ -445,24 +722,33 @@ def best_segments(
     win_size: float, nclips: int = TARGET_CLIPS,
     min_len: int = MIN_CLIP_LEN, max_len: int = MAX_CLIP_LEN
 ) -> List[Dict]:
-    if not audio_energy_per_second.any() : print("⚠️ Warning: Audio energy data is empty. Cannot select segments based on audio."); # Allow proceeding if motion is present
-    if not motion_score_per_second.any(): print("⚠️ Warning: Motion score data is empty. Cannot select segments based on motion."); # Allow proceeding if audio is present
-    if not audio_energy_per_second.any() and not motion_score_per_second.any(): print("❌ ERROR: Both audio and motion data are empty. Cannot select segments."); return []
+    if not audio_energy_per_second.any() : log.warning("Audio energy data is empty for segment scoring.");
+    if not motion_score_per_second.any(): log.warning("Motion score data is empty for segment scoring.");
+    if not audio_energy_per_second.any() and not motion_score_per_second.any(): 
+        log.error("Both audio and motion data are empty. Cannot select segments based on these criteria.")
+        return [] 
     
     video_duration_seconds = 0
     if audio_energy_per_second.any():
         video_duration_seconds = len(audio_energy_per_second) * win_size
-    elif motion_score_per_second.any(): # Fallback if audio_energy is empty but motion is not
+    elif motion_score_per_second.any(): 
         video_duration_seconds = len(motion_score_per_second) * win_size
 
-    if video_duration_seconds == 0: print("⚠️ Warning: Video duration is zero based on available data. Cannot select segments."); return []
+    if video_duration_seconds == 0: 
+        log.warning("Video duration is zero based on available audio/motion data. Cannot select segments.")
+        return []
 
-    analysis_window_duration = (min_len + max_len) // 2
-    if analysis_window_duration <= 0: analysis_window_duration = 60; print(f"⚠️ Warning: Calculated analysis_window_duration was <=0. Defaulted to {analysis_window_duration}s.")
-    step_size = max(15, analysis_window_duration // 4); potential_clips = []
-    print(f"⚙️  Analyzing video of {video_duration_seconds:.2f}s. Window: {analysis_window_duration}s, Step: {step_size}s")
+    analysis_window_duration = (min_len + max_len) // 2 
+    if analysis_window_duration <= 0: 
+        log.warning(f"Calculated analysis_window_duration was <=0. Defaulting to {(MIN_CLIP_LEN + MAX_CLIP_LEN) // 2}s.")
+        analysis_window_duration = (MIN_CLIP_LEN + MAX_CLIP_LEN) // 2
+    
+    step_size = 5 
+    
+    potential_clips = []
+    log.info(f"⚙️  Analyzing video of {video_duration_seconds:.2f}s. Target segment length: ~{analysis_window_duration}s, Step: {step_size}s")
 
-    for current_start_time in np.arange(0, video_duration_seconds - analysis_window_duration + 1, step_size):
+    for current_start_time in np.arange(0, video_duration_seconds - analysis_window_duration + 1e-9, step_size): 
         current_end_time = current_start_time + analysis_window_duration
         if current_end_time > video_duration_seconds: current_end_time = video_duration_seconds
         if current_start_time >= current_end_time : continue
@@ -471,9 +757,7 @@ def best_segments(
         timestamp_info = {'start': current_start_time, 'end': current_end_time}
         text_analysis_results = analyze_text(transcript_for_window, timestamp_info)
         
-        # For visual analysis, it's more complex. Ideally, we'd pass frames or the subclip.
-        # For now, video_path (full video) is passed, but analyze_visuals should handle frame extraction for the window.
-        visual_analysis_results = analyze_visuals(video_path, timestamp_info) # Pass full video path
+        visual_analysis_results = analyze_visuals(video_path, timestamp_info) 
 
         start_idx = int(current_start_time / win_size); end_idx = int(current_end_time / win_size)
         
@@ -490,7 +774,7 @@ def best_segments(
         virality_score = calculate_virality_score(text_analysis_results, visual_analysis_results, avg_audio, avg_motion)
         potential_clips.append({'start': current_start_time, 'end': current_end_time, 'score': virality_score, 'duration': current_end_time - current_start_time})
 
-    if not potential_clips: print("⚠️ No potential clips generated after analysis."); return []
+    if not potential_clips: log.warning("No potential clips generated after analysis."); return []
     potential_clips.sort(key=lambda x: x['score'], reverse=True); selected_clips = []; chosen_intervals = []
     for clip_candidate in potential_clips:
         if len(selected_clips) >= nclips: break
@@ -499,7 +783,7 @@ def best_segments(
         for chosen_s, chosen_e in chosen_intervals:
             if cs < chosen_e and chosen_s < ce: is_overlapping = True; break
         if not is_overlapping: selected_clips.append({'start': cs, 'end': ce, 'score': clip_candidate['score']}); chosen_intervals.append((cs, ce))
-    print(f"🏆 Selected {len(selected_clips)} clips out of {len(potential_clips)} potential clips.")
+    log.info(f"🏆 Selected {len(selected_clips)} clips out of {len(potential_clips)} potential clips.")
     return selected_clips
 
 def cut_clips(video_path: str, segments: List[Dict[str, float]], outdir="clips"):
@@ -513,90 +797,89 @@ def cut_clips(video_path: str, segments: List[Dict[str, float]], outdir="clips")
             subprocess.run(cmd, check=True, capture_output=True)
             outputs.append(name)
         except subprocess.CalledProcessError as e_cut:
-            print(f"❌ ERROR cutting clip {name}: {e_cut.stderr.decode('utf-8') if e_cut.stderr else e_cut}")
+            log.error(f"ERROR cutting clip [cyan]{name}[/cyan]: {e_cut.stderr.decode('utf-8') if e_cut.stderr else e_cut}", exc_info=True)
     return outputs
 
 def main():
-    """
-    Main function to orchestrate the video processing pipeline.
-    Handles input (local file or YouTube URL), downloads if necessary,
-    then runs transcription, audio/visual analysis, segment selection,
-    and clip cutting.
-    """
-    print("🚀 Starting Clip Extractor Pipeline...")
+    parser = argparse.ArgumentParser(description="Extracts viral clips from videos.")
+    parser.add_argument("video_input_source", type=str, help="URL or local path of the video to process.")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging.")
+    parser.add_argument("-o", "--output-dir", type=str, default="clips", help="Directory to save extracted clips.")
+    args = parser.parse_args()
+
+    if args.debug:
+        logging.getLogger("rich").setLevel(logging.DEBUG)
+        log.debug("🐞 Debug mode enabled.")
+
+    log.info("🚀 Starting Clip Extractor Pipeline...")
     load_stt_model() 
     load_llm_model() 
     load_vision_models()
 
-    video_input_source = "https://www.youtube.com/watch?v=dQw4w9WgXcQ" # Default to example
-    # Example for local file: video_input_source = "input.mp4" 
-    # video_input_source = os.getenv("VIDEO_INPUT", video_input_source) # Allow override from ENV
+    video_input_source = args.video_input_source
+    output_clips_dir = args.output_dir
 
-    video_path_for_processing = None
-    print(f"▶️ Processing input: {video_input_source}")
+    processed_video_path = None 
+    log.info(f"▶️ Processing input: [bold cyan]{video_input_source}[/bold cyan]")
 
     if validators.url(video_input_source):
-        print(f"🌐 Input identified as URL. Attempting download...")
-        download_output_dir = os.path.join(MODELS_DIR, "downloaded_videos") # Store in models/downloaded
+        log.info("🌐 Input identified as URL. Attempting download...")
+        download_output_dir = os.path.join(MODELS_DIR, "downloaded_videos") 
         os.makedirs(download_output_dir, exist_ok=True)
         downloaded_path = download_video(video_input_source, output_dir=download_output_dir)
-        if downloaded_path: video_path_for_processing = downloaded_path; print(f"✅ Video downloaded: {video_path_for_processing}")
-        else: print(f"❌ Failed to download video from URL: {video_input_source}. Exiting."); return
+        if downloaded_path: processed_video_path = downloaded_path; log.info(f"✅ Video downloaded: [green]{processed_video_path}[/green]")
+        else: log.critical(f"❌ Failed to download video from URL: {video_input_source}. Exiting."); return
     else:
-        print(f"📁 Input identified as local file path: {video_input_source}")
-        if os.path.exists(video_input_source): video_path_for_processing = video_input_source; print(f"✅ Local video found: {video_path_for_processing}")
-        else: print(f"❌ Local video file not found: {video_input_source}. Exiting."); return
+        log.info(f"📁 Input identified as local file path: [green]{video_input_source}[/green]")
+        if os.path.exists(video_input_source): processed_video_path = video_input_source; log.info(f"✅ Local video found.")
+        else: log.critical(f"❌ Local video file not found: {video_input_source}. Exiting."); return 
     
-    if not video_path_for_processing: print("❌ No valid video to process after input handling. Exiting."); return
+    if not processed_video_path: log.critical("❌ No valid video to process after input handling. Exiting."); return
 
     full_transcript = []
     try:
-        print("🎙️ Transcribing video...")
-        full_transcript = transcribe_video(video_path_for_processing) 
-        print(f"✅ Transcription complete. Segments: {len(full_transcript)}")
-        if not full_transcript: print("⚠️ Warning: Transcription returned no segments.")
-    except Exception as e: print(f"❌ ERROR during transcription: {e}\nCould not perform transcription. Exiting."); return
-
+        log.info("🎙️ Transcribing video...")
+        full_transcript = transcribe_video(processed_video_path) 
+        log.info(f"✅ Transcription complete. Segments: {len(full_transcript)}")
+        if not full_transcript: log.warning("Transcription returned no segments.")
+    except Exception as e: log.critical(f"ERROR during transcription: {e}\nCould not perform transcription. Exiting.", exc_info=True); return 
     audio_rms = np.array([])
     try: 
-        print("🎧 Analyzing audio for energy peaks...")
-        audio_rms = audio_peaks(video_path_for_processing, WIN_SIZE)
-        print(f"✅ Audio analysis complete. RMS array shape: {audio_rms.shape}")
-        if not audio_rms.any(): print("⚠️ Warning: Audio analysis (RMS) returned empty results.")
-    except Exception as e: print(f"❌ ERROR during audio analysis: {e}\nCould not perform audio analysis. Proceeding without audio energy data if possible."); audio_rms = np.array([]) # Allow continuation
-
+        log.info("🎧 Analyzing audio for energy peaks...")
+        audio_rms = audio_peaks(processed_video_path, WIN_SIZE)
+        log.info(f"✅ Audio analysis complete. RMS array shape: {audio_rms.shape}")
+        if not audio_rms.any(): log.warning("Audio analysis (RMS) returned empty results.")
+    except Exception as e: log.error(f"ERROR during audio analysis: {e}", exc_info=True); audio_rms = np.array([]) 
     motion = np.array([])
     try: 
-        print("🖼️ Analyzing video for motion...")
-        motion = motion_peaks(video_path_for_processing, WIN_SIZE)
-        print(f"✅ Motion analysis complete. Motion array shape: {motion.shape}")
-        if not motion.any(): print("⚠️ Warning: Motion analysis returned empty results.")
-    except Exception as e: print(f"❌ ERROR during motion analysis: {e}\nCould not perform motion analysis. Proceeding without motion data if possible."); motion = np.array([]) # Allow continuation
-
+        log.info("🖼️ Analyzing video for motion...")
+        motion = motion_peaks(processed_video_path, WIN_SIZE)
+        log.info(f"✅ Motion analysis complete. Motion array shape: {motion.shape}")
+        if not motion.any(): log.warning("Motion analysis returned empty results.")
+    except Exception as e: log.error(f"ERROR during motion analysis: {e}", exc_info=True); motion = np.array([]) 
     segments = []
     try:
-        print("🧠 Identifying best segments with AI...")
-        segments = best_segments(video_path_for_processing, full_transcript, audio_rms, motion, WIN_SIZE, TARGET_CLIPS, MIN_CLIP_LEN, MAX_CLIP_LEN)
-        print(f"✅ Segment identification complete. Found {len(segments)} potential clips.")
-    except Exception as e: print(f"❌ ERROR during segment identification: {e}\nCould not identify best segments. Exiting."); return
+        log.info("🧠 Identifying best segments with AI...")
+        segments = best_segments(processed_video_path, full_transcript, audio_rms, motion, WIN_SIZE, TARGET_CLIPS, MIN_CLIP_LEN, MAX_CLIP_LEN)
+        log.info(f"✅ Segment identification complete. Found {len(segments)} potential clips.")
+    except Exception as e: log.error(f"ERROR during segment identification: {e}. Exiting.", exc_info=True); return
     
-    files = []
-    output_clips_dir = "clips" # Define output directory for generated clips
-    print(f"🔖 Selected Segments (Top {TARGET_CLIPS}):")
+    files = []    
+    log.info(f"🔖 Selected Segments (Top {TARGET_CLIPS}):")
     if segments:
         for i, seg_info in enumerate(segments):
             start_time_str = f"{seg_info['start']:.2f}"; end_time_str = f"{seg_info['end']:.2f}"; virality_score_str = f"{seg_info['score']:.2f}"
-            print(f"  Clip #{i+1}: [{start_time_str}s - {end_time_str}s], Virality Score: {virality_score_str}")
+            log.info(f"  Clip #{i+1}: [{start_time_str}s - {end_time_str}s], Score: [bold yellow]{virality_score_str}[/bold yellow]")
         try:
-            print(f"✂️  Cutting clips into '{output_clips_dir}/'...")
-            files = cut_clips(video_path_for_processing, segments, outdir=output_clips_dir) 
-            if not files: print("⚠️ WARNING: `cut_clips` executed but returned no file paths. Clips might be missing.")
-            else: print(f"✅🎞️ Generated clip files: {files}")
-        except Exception as e: print(f"❌ ERROR during clip cutting: {e}\nCould not cut clips.")
-    else: print("ℹ️ No segments were selected by `best_segments` to be cut.")
+            log.info(f"✂️  Cutting clips into '[bold green]{os.path.abspath(output_clips_dir)}[/bold green]/'...")
+            files = cut_clips(processed_video_path, segments, outdir=output_clips_dir) 
+            if not files: log.warning("`cut_clips` executed but returned no file paths. Clips might be missing.")
+            else: log.info(f"✅🎞️ Generated clip files: {[str(f) for f in files]}")
+        except Exception as e: log.error(f"ERROR during clip cutting: {e}", exc_info=True)
+    else: log.info("ℹ️ No segments were selected by `best_segments` to be cut.")
     
-    if not files: print("🏁 Pipeline finished. ⚠️ No clips were ultimately generated or saved.")
-    else: print(f"🏁 Pipeline finished successfully. {len(files)} clips generated in '{os.path.abspath(output_clips_dir)}'.")
+    if not files: log.warning("🏁 Pipeline finished. ⚠️ No clips were ultimately generated or saved.")
+    else: log.info(f"🏁 Pipeline finished successfully. {len(files)} clips generated in '[bold green]{os.path.abspath(output_clips_dir)}[/bold green]'.")
 
 if __name__ == "__main__":
     main()

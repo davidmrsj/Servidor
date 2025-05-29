@@ -12,7 +12,7 @@ app = FastAPI()
 upscaler = ImageUpscaler()
 qualityFaces = GFPGANService()
 
-clipExtractor.main()
+#clipExtractor.main()
 
 @app.get("/")
 async def home():
