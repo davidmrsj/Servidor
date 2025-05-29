@@ -4,8 +4,8 @@ import shutil # For cleaning up output directory
 from pathlib import Path
 
 # Adjust import path as necessary
-from app.services.services.clipExtractor import main as clip_extractor_main 
-from app.services.services import clipExtractor as clipExtractor_module # To mock globals
+from clipExtractor import main as clip_extractor_main 
+from . import clipExtractor as clipExtractor_module # To mock globals
 
 # Mock the logger at the module level of clipExtractor
 @pytest.fixture(autouse=True) # Apply to all tests in this file

@@ -1,5 +1,5 @@
 import pytest
-from app.services.services.clipExtractor import calculate_virality_score, VIRALITY_CONFIG
+from clipExtractor import calculate_virality_score, VIRALITY_CONFIG
 
 # Mock the logger if calculate_virality_score uses it (currently it doesn't directly, but good practice if it might)
 @pytest.fixture

@@ -2,121 +2,97 @@ import os
 import subprocess # To call yt-dlp
 import re
 from typing import Optional
+from pathlib import Path
+
+COOKIES_FILE = r"C:\Servidor\cookies.txt" 
 
 def get_video_filename(youtube_url: str, output_dir: str) -> Optional[str]:
     """
-    Retrieves the expected filename for a YouTube video using yt-dlp's --get-filename.
-    This helps check for existing files without downloading the whole video.
-    Cleans the filename to be filesystem-friendly.
+    Devuelve el nombre de archivo que yt-dlp generaría para un vídeo,
+    usando las cookies para saltar los chequeos de bot.
     """
     try:
-        # Get the title or ID based filename yt-dlp would generate
-        # -o specifies output template. %(title)s.%(ext)s or %(id)s.%(ext)s are common.
-        # Using %(id)s for more stable filenames.
         cmd = [
-            'yt-dlp',
-            '--get-filename',
-            '-o', '%(id)s.%(ext)s', # Output template: videoID.extension
-            youtube_url
+            "yt-dlp",
+            "--cookies", COOKIES_FILE,
+            "--get-filename",
+            "-o", "%(id)s.%(ext)s",           # siempre <ID>.ext
+            youtube_url,
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, encoding='utf-8')
-        raw_filename = result.stdout.strip()
-        
-        # Sanitize the filename (though yt-dlp often does this, an extra layer doesn't hurt)
-        # Remove invalid characters, replace spaces with underscores
-        sanitized_filename = re.sub(r'[\/*?:"<>|]', "", raw_filename)
-        sanitized_filename = re.sub(r'\s+', '_', sanitized_filename)
-        
-        if not sanitized_filename:
-            print(f"Error: Could not determine a valid filename for URL: {youtube_url}")
+        result = subprocess.run(
+            cmd, text=True, capture_output=True, check=True, encoding="utf-8"
+        )
+        raw_name = result.stdout.strip()
+
+        # limpieza mínima extra
+        clean_name = re.sub(r'[\/*?:"<>|]', "", raw_name)
+        clean_name = re.sub(r"\s+", "_", clean_name)
+
+        if not clean_name:
+            print(f"No se pudo determinar nombre para {youtube_url}")
             return None
-        return os.path.join(output_dir, sanitized_filename)
+        return os.path.join(output_dir, clean_name)
 
     except subprocess.CalledProcessError as e:
-        print(f"Error getting filename with yt-dlp for {youtube_url}: {e}")
-        print(f"yt-dlp stdout: {e.stdout}")
-        print(f"yt-dlp stderr: {e.stderr}")
+        print("yt-dlp --get-filename falló:", e.stderr or e.stdout)
         return None
     except Exception as e:
-        print(f"An unexpected error occurred while getting filename for {youtube_url}: {e}")
+        print("Error inesperado en get_video_filename:", e)
         return None
 
 def download_video(youtube_url: str, output_dir: str = "app/media") -> Optional[str]:
     """
-    Downloads a video from the given YouTube URL using yt-dlp.
-
-    Args:
-        youtube_url: The URL of the YouTube video.
-        output_dir: The directory to save the downloaded video. 
-                    Defaults to "app/media".
-
-    Returns:
-        The full path to the downloaded video file if successful, 
-        otherwise None.
+    Descarga el vídeo (mp4) usando las mismas cookies.
+    Si el archivo ya existe, lo reutiliza.
     """
-    os.makedirs(output_dir, exist_ok=True)
+    out_dir = Path(output_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_template = str(out_dir / "%(id)s.%(ext)s")
 
-    # Determine the expected output filename
-    # This uses yt-dlp to get the filename without downloading if possible,
-    # or constructs a generic one if that fails.
-    # Using video ID as filename for consistency and to avoid special characters.
-    expected_filename_path = get_video_filename(youtube_url, output_dir)
-
-    if not expected_filename_path:
-        print(f"Could not determine filename for {youtube_url}. Download aborted.")
-        return None
-
-    # Check if the video already exists
-    if os.path.exists(expected_filename_path):
-        print(f"Video already exists: {expected_filename_path}")
-        return expected_filename_path
-
-    print(f"Attempting to download video: {youtube_url} to {expected_filename_path}...")
+    # --- consultar ID para ver si ya está ---
     try:
-        # Using -o to specify the exact output path and filename
-        # Format selection: best video and audio, merged. mp4 preferred.
-        # Example: -f "bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best"
-        cmd = [
-            'yt-dlp',
-            '-f', 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best', # Standard format selection
-            '-o', expected_filename_path, # Output template
-            '--merge-output-format', 'mp4', # Ensure final output is mp4 if merging
-            youtube_url
-        ]
-        
-        # Run yt-dlp
-        # Increased timeout for potentially long downloads.
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=3600) # 1 hour timeout
+        vid_id = subprocess.check_output(
+            ["yt-dlp", "--cookies", COOKIES_FILE, "--print", "id", "-q", youtube_url],
+            text=True
+        ).strip()
+        target = out_dir / f"{vid_id}.mp4"
+        if target.exists():
+            print(f"✔️  Ya estaba descargado: {target}")
+            return str(target)
+    except Exception:
+        target = None  # si falla, descargará igualmente
 
-        print(f"Video downloaded successfully: {expected_filename_path}")
-        return expected_filename_path
+    # --- construir comando de descarga (con cookies) -------------
+    ydl_cmd = [
+        "yt-dlp",
+        "--cookies", COOKIES_FILE,
+        "-f", "bestvideo[ext=mp4]+bestaudio[ext=m4a]/mp4",
+        "--merge-output-format", "mp4",
+        "-o", out_template,
+        youtube_url,
+    ]
 
-    except subprocess.CalledProcessError as e:
-        print(f"Error downloading video with yt-dlp: {youtube_url}")
-        print(f"Return code: {e.returncode}")
-        print(f"Output (stdout): {e.stdout}")
-        print(f"Output (stderr): {e.stderr}")
-        # Try to remove partially downloaded file if error occurred
-        if os.path.exists(expected_filename_path):
-            try:
-                os.remove(expected_filename_path)
-                print(f"Removed partially downloaded file: {expected_filename_path}")
-            except OSError as oe:
-                print(f"Error removing partially downloaded file {expected_filename_path}: {oe}")
+    # --- descargar ------------------------------------------------
+    try:
+        print("⬇️  Descargando con yt-dlp…")
+        subprocess.run(ydl_cmd, check=True)
+    except subprocess.CalledProcessError as err:
+        print("❌  yt-dlp devolvió error:", err)
+        if target and target.exists():
+            target.unlink(missing_ok=True)
         return None
-    except subprocess.TimeoutExpired:
-        print(f"Timeout occurred while downloading {youtube_url}. Download may be incomplete.")
-        # Try to remove partially downloaded file
-        if os.path.exists(expected_filename_path):
-            try:
-                os.remove(expected_filename_path)
-                print(f"Removed partially downloaded file due to timeout: {expected_filename_path}")
-            except OSError as oe:
-                print(f"Error removing partially downloaded file {expected_filename_path} after timeout: {oe}")
-        return None
-    except Exception as e:
-        print(f"An unexpected error occurred: {e}")
-        return None
+
+    # --- localizar archivo final ---------------------------------
+    if not target:
+        mp4s = sorted(out_dir.glob("*.mp4"), key=lambda p: p.stat().st_mtime, reverse=True)
+        target = mp4s[0] if mp4s else None
+
+    if target and target.exists():
+        print(f"✅  Descargado: {target}")
+        return str(target)
+
+    print("❌  No se encontró el archivo descargado.")
+    return None
 
 if __name__ == '__main__':
     # Example Usage (for testing the module directly)

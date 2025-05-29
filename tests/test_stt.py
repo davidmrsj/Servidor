@@ -5,7 +5,7 @@ from scipy.io import wavfile
 import tempfile
 
 # Adjust import paths as necessary
-from app.services.services.clipExtractor import load_stt_model, transcribe_video, DEVICE, _stt_model as clipExtractor_stt_model, MODEL_PATH_STT
+from clipExtractor import load_stt_model, transcribe_video, DEVICE, _stt_model as clipExtractor_stt_model, MODEL_PATH_STT
 from faster_whisper import WhisperModel # For mocking its constructor
 
 # Mock the logger

@@ -4,7 +4,7 @@ import subprocess # Required for CompletedProcess
 
 # Assuming clipExtractor.py is in app.services.services
 # Adjust the import path based on your project structure and how pytest discovers modules
-from app.services.services.clipExtractor import download_video, get_video_filename, log # Import log
+from clipExtractor import download_video, get_video_filename, log # Import log
 
 # Mock the logger for testing log messages
 @pytest.fixture
