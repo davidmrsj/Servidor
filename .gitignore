@@ -10,3 +10,6 @@ __pycache__/
 
 /gfpgan
 /m
+/clips
+/debug_outputs
+cookies.txt

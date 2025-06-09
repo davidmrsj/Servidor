@@ -36,7 +36,7 @@ from typing import List, Dict, Optional
 import json
 from app.services.services.download_youtube_video import download_video
 import validators
-from transformers import BitsAndBytesConfig, pipeline
+from transformers import BitsAndBytesConfig, pipeline, AutoTokenizer
 import torchvision.transforms.functional as TF
 import logging
 import argparse
@@ -142,7 +142,7 @@ MOTION_W     = 1.0
 
 # ───────── AI MODEL CONFIGURATION ───────── #
 MODEL_PATH_STT = "small"
-LLM_MODEL_PRIMARY = "meta-llama/Llama-2-7b-chat-hf"
+LLM_MODEL_PRIMARY = "mistralai/Mistral-7B-Instruct-v0.2"
 LLM_MODEL_FALLBACK_OPEN = "google/gemma-2b-it"
 LLM_MODEL_FALLBACK_SMALL = "distilgpt2" 
 MODEL_PATH_VISION_YOLO = "yolov5s.pt" 
@@ -160,7 +160,7 @@ VIRALITY_CONFIG = {
         'visual_intensity': 1.0,
         'facial_expression_happy': 1.2,
         'fast_cuts_or_action': 1.1,
-        'audio_energy_avg': 0.5,
+        'audio_energy_avg': 0.25,
         'motion_avg': 0.3,
         'vertical_cropability': 1.5 
     },
@@ -209,7 +209,7 @@ def load_llm_model():
     current_quant_config = bnb_config_gpu if DEVICE.type == "cuda" else None
 
     # Attempt 1: Llama-2 (Primary)
-    if hf_token and DEVICE.type == "cuda": 
+    if DEVICE.type == "cuda": 
         log.info(f"🧠 Attempting to load Primary LLM: {LLM_MODEL_PRIMARY} (4-bit with HF_TOKEN on GPU)...")
         try:
             _tokenizer = AutoTokenizer.from_pretrained(LLM_MODEL_PRIMARY, cache_dir=MODELS_DIR, token=hf_token)
@@ -985,34 +985,11 @@ def _split_transcript_into_chunks(
 
 
 async def _call_llm_for_segments(transcript_segments: List[Dict], video_duration: float, is_chunk: bool = False, chunk_num: int = 0, total_chunks: int = 0) -> List[Dict]:
-    """
-    Asynchronously calls the LLM to get candidate segments from transcript text.
-
-    This function prepares a prompt with the given transcript segments (which can be
-    a full transcript or a chunk thereof), invokes the LLM using a synchronous
-    Hugging Face pipeline run in a separate thread (via `asyncio.to_thread`),
-    and then parses the LLM's JSON output.
-
-    Args:
-        transcript_segments: A list of dictionaries, where each dictionary represents
-                             a segment of the transcript (e.g., from Whisper).
-                             Expected keys: 'text'.
-        video_duration: The total duration of the video in seconds, used for context in the prompt.
-        is_chunk: Boolean flag indicating if the `transcript_segments` represent a chunk
-                  of a larger transcript. Defaults to False.
-        chunk_num: If `is_chunk` is True, the number of the current chunk.
-        total_chunks: If `is_chunk` is True, the total number of chunks.
-
-    Returns:
-        A list of dictionaries, where each dictionary represents a candidate highlight
-        segment suggested by the LLM. Returns an empty list if errors occur or no
-        valid segments are found.
-    """
     if not _llm or not _tokenizer:
         log.warning("LLM model or tokenizer not loaded in _call_llm_for_segments.")
         return []
 
-    transcript_text = " ".join([segment['text'] for segment in transcript_segments if 'text' in segment])
+    transcript_text = " ".join(segment["text"] for segment in transcript_segments if "text" in segment)
     if not transcript_text.strip():
         log.warning("Transcript text for LLM call is blank.")
         return []
@@ -1021,115 +998,109 @@ async def _call_llm_for_segments(transcript_segments: List[Dict], video_duration
     if is_chunk:
         prompt_intro = f"You are an expert video editor. You are analyzing CHUNK {chunk_num}/{total_chunks} of a video transcript. Focus on identifying viral moments within this specific chunk. All timestamps are absolute from the beginning of the full video."
 
-    # Max new tokens should be dynamically adjusted based on remaining context or typical response size.
-    # For now, keeping it fixed as it was.
     max_new_tokens_for_llm_response = 3000
-
     prompt = f"""{prompt_intro}
 The total video duration is {video_duration:.2f} seconds.
-Your goal is to identify around 15-20 distinct segments (or fewer if the chunk is short) that have high potential to be engaging short clips.
-Each segment should ideally be between 30 and 90 seconds long.
 
-Provide your output as a JSON list of dictionaries. Each dictionary in the list should represent one candidate segment and must follow this exact format:
-{{
-  "start_time": <float>,  // Start time of the segment in seconds from the beginning of the video
-  "end_time": <float>,    // End time of the segment in seconds from the beginning of the video
-  "theme": "<string>",     // A concise theme or topic for this segment (e.g., "Funny Reaction", "Key Product Feature", "Dramatic Climax")
-  "reason_for_highlight": "<string>", // Brief explanation why this segment is a good candidate for a highlight
-  "estimated_duration": <float> // Estimated duration of the segment in seconds (end_time - start_time)
-}}
+⚠️ IMPORTANT RULES ⚠️
+• Every segment MUST last **between 30 and 90 seconds** (both limits inclusive).  
+• Segments < 30 s or > 90 s will be ignored automatically.  
+• Return **at most 20** segments.
 
-Ensure that "start_time" and "end_time" are accurate floating-point numbers representing seconds from the video's beginning.
-Ensure "estimated_duration" is correctly calculated.
-Do not include any segments that would be shorter than 10 seconds or longer than 120 seconds, aiming for the 30-90 second range.
+Output a JSON list like:
+[
+  {{
+    "start_time": <float>,       // in seconds
+    "end_time": <float>,         // in seconds
+    "theme": "<string>",
+    "reason_for_highlight": "<string>",
+    "estimated_duration": <float>
+  }},
+  ...
+]
 
-Here is the video transcript (or a chunk of it):
+Here is the transcript you are analysing:
 --- START TRANSCRIPT ---
 {transcript_text}
 --- END TRANSCRIPT ---
 
-Now, provide the JSON list of candidate segments:
+Now provide ONLY the JSON list (no explanation):
 """
-    source_log_str = f"Source: {'Chunk ' + str(chunk_num) + '/' + str(total_chunks) if is_chunk else 'Full Transcript'}"
-    log.info(f"🧠 Requesting candidate segments from LLM. {source_log_str}. Text length: {len(transcript_text)} chars.")
+    source_log_str = f"Source: Chunk {chunk_num}/{total_chunks}" if is_chunk else "Source: Full Transcript"
+    log.info(f"🧠 Requesting candidate segments from LLM. {source_log_str}. Transcript length: {len(transcript_text)} chars.")
 
-    llm_raw_output = ""
     try:
-        # Synchronous part to be run in a thread
         def sync_llm_call(p_text, pipeline_obj, max_tokens):
-            # This pipeline object might not be thread-safe if it shares underlying resources like model weights in a mutable way.
-            # However, Hugging Face pipelines are generally designed to be used in such scenarios,
-            # and issues usually arise from GPU memory contention if multiple threads try to use the GPU simultaneously without proper management.
-            # For CPU-bound models or if device_map="auto" handles this well, it might be fine.
-            # If issues arise, a process pool or a more sophisticated queuing mechanism might be needed.
-            outputs = pipeline_obj(p_text, max_new_tokens=max_tokens, do_sample=False, temperature=0.1, top_k=5) # Reduced top_k from previous state
-            if outputs and isinstance(outputs, list) and "generated_text" in outputs[0]:
-                return outputs[0]["generated_text"]
-            return None
+            outputs = pipeline_obj(p_text, max_new_tokens=max_tokens, do_sample=False, temperature=0.1, top_k=5)
+            return outputs[0]["generated_text"] if outputs and isinstance(outputs, list) and "generated_text" in outputs[0] else None
 
-        # Create the pipeline object inside the async function, but before passing to thread.
-        # This ensures that the pipeline object is created in the context of the event loop,
-        # though the actual execution happens in the thread.
-        # For some models/pipelines, this might still be an issue if the model itself is not thread-safe.
-        # If _llm and _tokenizer are global and loaded on the main thread, this should generally be okay.
-        text_gen_pipeline_obj = pipeline("text-generation", model=_llm, tokenizer=_tokenizer)
+        from transformers import pipeline as _pipe
+        text_gen_pipeline_obj = _pipe("text-generation", model=_llm, tokenizer=_tokenizer)
+        import asyncio
+        llm_raw_output = await asyncio.to_thread(sync_llm_call, prompt, text_gen_pipeline_obj, max_new_tokens_for_llm_response)
 
-        llm_raw_output = await asyncio.to_thread(
-            sync_llm_call,
-            prompt,
-            text_gen_pipeline_obj, # Pass the created pipeline object
-            max_new_tokens_for_llm_response
-        )
-
-        if not llm_raw_output: # Check if llm_raw_output is None or empty
-            log.error(f"❌ LLM pipeline ({source_log_str}) did not return any text output.")
+        if not llm_raw_output:
+            log.error(f"❌ LLM pipeline ({source_log_str}) returned no text.")
             return []
 
-        if prompt.strip() in llm_raw_output: # Strip prompt from beginning
+        import os, time
+        os.makedirs("debug_outputs", exist_ok=True)
+        raw_fn = f"llm_raw_{'chunk'+str(chunk_num) if is_chunk else 'full'}_{int(time.time())}.txt"
+        raw_path = os.path.join("debug_outputs", raw_fn)
+        with open(raw_path, "w", encoding="utf-8") as f:
+            f.write(llm_raw_output)
+        log.info(f"Raw LLM output saved to {raw_path}")
+
+        if prompt.strip() in llm_raw_output:
             llm_raw_output = llm_raw_output.split(prompt.strip(), 1)[-1].strip()
         elif "Now, provide the JSON list of candidate segments:" in llm_raw_output:
             llm_raw_output = llm_raw_output.split("Now, provide the JSON list of candidate segments:", 1)[-1].strip()
 
-        log.debug(f"LLM Raw Output for {source_log_str}:\n{llm_raw_output}")
-
-        json_start_index = llm_raw_output.find('[')
-        json_end_index = llm_raw_output.rfind(']')
-
-        if json_start_index != -1 and json_end_index != -1 and json_start_index < json_end_index:
-            json_str = llm_raw_output[json_start_index : json_end_index + 1]
-            try:
-                candidate_segments = json.loads(json_str)
-                if isinstance(candidate_segments, list):
-                    valid_segments = []
-                    for item in candidate_segments:
-                        if isinstance(item, dict) and \
-                           all(key in item for key in ["start_time", "end_time", "theme", "reason_for_highlight", "estimated_duration"]) and \
-                           isinstance(item["start_time"], (int, float)) and \
-                           isinstance(item["end_time"], (int, float)) and \
-                           isinstance(item["estimated_duration"], (int, float)):
-                            if not (0 <= item["start_time"] < video_duration and 0 < item["end_time"] <= video_duration + 0.1): # allow for slight overrun due to rounding
-                                log.warning(f"LLM suggested segment with out-of-bounds times for video duration {video_duration:.2f}s: {item}. ({source_log_str}). Skipping.")
-                                continue
-                            valid_segments.append(item)
-                        else:
-                            log.warning(f"Skipping invalid segment from LLM ({source_log_str}): {item}")
-                    log.info(f"✅ LLM ({source_log_str}) returned {len(valid_segments)} valid candidate segments.")
-                    return valid_segments
-                else:
-                    log.error(f"❌ LLM output ({source_log_str}) was valid JSON, but not a list. Output: {json_str}")
-                    return []
-            except json.JSONDecodeError as e_json:
-                log.error(f"❌ Failed to parse JSON from LLM output ({source_log_str}): {e_json}", exc_info=False)
-                log.debug(f"Problematic JSON string ({source_log_str}): {json_str}")
-                return []
+        import re, json
+        m = re.search(r"```json\s*(\[[\s\S]*?\])", llm_raw_output, re.IGNORECASE)
+        if m:
+            json_str = m.group(1)
         else:
-            log.error(f"❌ Could not find a valid JSON list structure in LLM output ({source_log_str}). Raw output was: {llm_raw_output}")
+            i, j = llm_raw_output.find("["), llm_raw_output.rfind("]")
+            if i == -1 or j == -1 or i >= j:
+                log.error(f"❌ No JSON array found in LLM output ({source_log_str}).")
+                return []
+            json_str = llm_raw_output[i : j + 1]
+
+        json_str = re.sub(r"^\s*\.\.\.\s*$", "", json_str, flags=re.MULTILINE)
+        json_str = re.sub(r",\s*([}\]]])", r"\1", json_str)
+
+        try:
+            candidate_segments = json.loads(json_str)
+        except Exception as e_json:
+            log.error(f"❌ Failed to parse JSON from LLM output ({source_log_str}): {e_json}")
+            log.debug(f"Problematic JSON string ({source_log_str}):\n{json_str}")
+            return []
+
+        if isinstance(candidate_segments, list):
+            valid_segments = []
+            for item in candidate_segments:
+                if (
+                    isinstance(item, dict)
+                    and all(key in item for key in ["start_time", "end_time", "theme", "reason_for_highlight", "estimated_duration"])
+                    and isinstance(item["start_time"], (int, float))
+                    and isinstance(item["end_time"], (int, float))
+                    and isinstance(item["estimated_duration"], (int, float))
+                    and 0 <= item["start_time"] < video_duration
+                    and 0 < item["end_time"] <= video_duration + 0.1
+                ):
+                    valid_segments.append(item)
+            log.info(f"✅ LLM ({source_log_str}) returned {len(valid_segments)} valid segments.")
+            return valid_segments
+        else:
+            log.error(f"❌ LLM output ({source_log_str}) was JSON but not a list.")
             return []
 
     except Exception as e:
         log.error(f"❌ ERROR during LLM call ({source_log_str}): {e}", exc_info=True)
-        log.debug(f"LLM Raw Output at time of error ({source_log_str}): {llm_raw_output}")
+        log.debug(f"LLM Raw Output at time of error ({source_log_str}):\n{llm_raw_output}")
         return []
+
 
 def calculate_virality_score(
     text_analysis: Dict, visual_analysis: Dict,
